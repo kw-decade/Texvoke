@@ -1,0 +1,37 @@
+{
+  "model": "gpt-4o",
+  "instructions": "你是一个天气助手，回答尽量简短。",
+  "input": [
+    {
+      "role": "user",
+      "content": "旧金山和东京现在天气怎么样？"
+    }
+  ],
+  "tools": [
+    {
+      "type": "function",
+      "name": "get_weather",
+      "description": "查询指定城市的当前天气",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "city": {
+            "type": "string",
+            "description": "城市名"
+          },
+          "unit": {
+            "type": "string",
+            "enum": ["celsius", "fahrenheit"]
+          }
+        },
+        "required": ["city"],
+        "additionalProperties": false
+      }
+    }
+  ],
+  "tool_choice": "auto",
+  "parallel_tool_calls": true,
+  "max_output_tokens": 2048,
+  "store": true,
+  "temperature": 0.2
+}

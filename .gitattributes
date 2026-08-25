@@ -1,0 +1,23 @@
+# 统一用 LF 存储，避免跨平台 checkout 产生虚假 diff。
+* text=auto eol=lf
+
+*.go     text eol=lf
+*.md     text eol=lf
+*.mod    text eol=lf
+*.sum    text eol=lf
+*.yaml   text eol=lf
+*.yml    text eol=lf
+*.json   text eol=lf
+
+# 协议 fixture 必须逐字节保留，禁止任何行尾转换。
+#
+# 这不是洁癖：SSE 与 HTTP 协议对 CRLF 和 LF 的区别是敏感的，规格九章明确要求
+# 解析器正确处理「CRLF/LF 差异」。若 git 在 checkout 时替换了行尾，fixture 就
+# 不再是真实上游发出的字节，测试会在错误的数据上通过。
+tests/fixtures/** -text
+
+# 二进制文件
+*.png binary
+*.jpg binary
+*.gz  binary
+*.zip binary

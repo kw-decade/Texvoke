@@ -1,0 +1,74 @@
+{
+ "_comment": [
+  "评测 fixture 清单。每一项描述这份 fixture 覆盖什么、期望模型做什么。",
+  "",
+  "codex-* 两份来自真实抓包，经 cmd/utr-redact 脱敏：用户名与路径做了等长替换",
+  "（用户名等长替换为 USER0），用户自己的 AGENTS.md 换成等长的中性文本。等长是刻意的——",
+  "评测要测的正是「协议指令被几十 KB 业务指令稀释」，长度是关键自变量。",
+  "客户端自己的 prompt（沙箱说明、工具描述）是公开内容，原样保留。",
+  "",
+  "重新生成：go run ./cmd/utr-redact -in <你的抓包> -out tests/fixtures/eval/<名字>.json"
+ ],
+ "fixtures": [
+  {
+   "file": "codex-first-turn.json",
+   "protocol": "responses",
+   "why": "Codex 首轮的真实形状：工具在 additional_tools item 里、exec 是无 schema 的裸文本工具、指令是 developer 角色而非 system。70 KB 里协议说明只占 1.5%，这是最能暴露稀释问题的一份。",
+   "expect": "调用 exec，脚本里用 tools.shell_command 列目录",
+   "expect_tool": "exec",
+   "watch": [
+    "persona_refusal：模型说「我不能直接读取文件系统」——它没意识到自己有工具",
+    "format_noncompliance：发了信号但 envelope 写坏了"
+   ]
+  },
+  {
+   "file": "codex-multi-turn.json",
+   "protocol": "responses",
+   "why": "同一会话跑了 4 个 turn 之后的形状。Codex 每 turn 重发整套指令，所以 19 条消息里有 66% 是重复内容——这份 fixture 是指令去重的直接验证对象。同时含 custom_tool_call 历史，验证历史文本化。",
+   "expect": "调用 exec；去重生效后消息数应从 19 降到 10 左右",
+   "expect_tool": "exec",
+   "watch": [
+    "去重是否把 user 消息也删了（不该删）",
+    "历史里的工具调用有没有被渲染成 envelope 文本"
+   ]
+  },
+  {
+   "file": "chat-tools.json",
+   "protocol": "chat",
+   "why": "Chat 协议基线。手写、极短，用来确认「失败不是因为上下文太长」——这一份如果也失败，问题在协议层而不是稀释。",
+   "expect": "调用 get_weather，参数含 city",
+   "expect_tool": "get_weather",
+   "watch": []
+  },
+  {
+   "file": "anthropic-tools.json",
+   "protocol": "anthropic",
+   "why": "Anthropic 协议基线，作用同上。另外它是唯一验证「格式提醒并进最后一条消息」那条分支的 fixture（Anthropic 只允许一条 system）。",
+   "expect": "调用 get_weather，参数含 city",
+   "expect_tool": "get_weather",
+   "watch": []
+  },
+  {
+   "file": "claude-code-hook.json",
+   "protocol": "anthropic",
+   "why": "Claude Code 真实形状（2026-08-24 抓包）：system 在顶层为数组、messages 里还有 hook 插件注入的 31KB 行为规则、80 个工具含大量长描述 MCP 工具。这是「协议说明落点自适应」与 AlwaysInclude 的直接验证对象。",
+   "expect": "调用文件/终端类工具（Glob/Bash/Read 任一）",
+   "expect_tool": "Bash",
+   "watch": [
+    "模型说「没有提供文件读取或终端工具」= 协议说明被淹没复发",
+    "选错工具（调 Workflow/Agent 之类）算 wrong_tool，单独计数"
+   ]
+  },
+  {
+   "file": "codex-stuck.json",
+   "protocol": "responses",
+   "why": "Codex 卡死会话（2026-08-24 抓包）：14 条 input 含成功调用与多条失败文本，历史污染最重的形态。这是恢复循环（handshake/no_call_hint）与承诺型识别的直接验证对象。",
+   "expect": "调用 exec 创建文件",
+   "expect_tool": "exec",
+   "watch": [
+    "模型反复声称工具不可用而零调用 = 恢复循环未触发",
+    "call_id 跨轮重复导致的解码拒绝不应再出现"
+   ]
+  }
+ ]
+}

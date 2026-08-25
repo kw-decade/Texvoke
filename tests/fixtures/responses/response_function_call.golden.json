@@ -1,0 +1,44 @@
+{
+  "created_at": 1700000000,
+  "id": "resp_fixture01",
+  "incomplete_details": null,
+  "model": "gpt-4o",
+  "object": "response",
+  "output": [
+    {
+      "content": [
+        {
+          "annotations": [],
+          "text": "我来分别查一下这两个城市。",
+          "type": "output_text"
+        }
+      ],
+      "id": "msg_fixture01",
+      "role": "assistant",
+      "status": "completed",
+      "type": "message"
+    },
+    {
+      "arguments": "{\"city\":\"San Francisco\",\"unit\":\"celsius\"}",
+      "call_id": "call_9kL2mN4pQ",
+      "id": "fc_68a1aaa1111",
+      "name": "get_weather",
+      "status": "completed",
+      "type": "function_call"
+    },
+    {
+      "arguments": "{\"city\":\"Tokyo\",\"unit\":\"celsius\"}",
+      "call_id": "call_7xY8zA1bC",
+      "id": "fc_68a1bbb2222",
+      "name": "get_weather",
+      "status": "completed",
+      "type": "function_call"
+    }
+  ],
+  "status": "completed",
+  "usage": {
+    "input_tokens": 384,
+    "output_tokens": 96,
+    "total_tokens": 480
+  }
+}

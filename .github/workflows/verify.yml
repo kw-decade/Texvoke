@@ -1,0 +1,50 @@
+name: verify
+
+# 六条验证命令的自动化版本（gofmt / build / vet / test / test -race）。
+#
+# 为什么要它：2026-08-25 的审计发现 gofmt 门已经红了一天多没人察觉——
+# 一个文件被编辑器存成了 CRLF。验证靠人记得手动跑，就总会有忘记的那次。
+#
+# 私有仓库同样能跑 Actions（只是计入账户的分钟额度）。这个 workflow 一次
+# 约 1-2 分钟，全部用官方 action，不引入任何第三方依赖。
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch: # 允许手动触发，改完 CI 本身时用得上
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # go-version-file 直接读 go.mod，升级 Go 版本时不用同步改两处。
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      # gofmt 逐目录扫而不用 .：GOTMPDIR 下会有自动生成的 _testmain.go。
+      # gofmt -l 本身不设退出码，所以要自己判断输出是否为空。
+      - name: gofmt
+        run: |
+          out=$(gofmt -l ./cmd ./internal ./pkg ./examples)
+          if [ -n "$out" ]; then
+            echo "以下文件需要 gofmt -w："
+            echo "$out"
+            exit 1
+          fi
+
+      - name: build
+        run: go build ./...
+
+      - name: vet
+        run: go vet ./...
+
+      - name: test
+        run: go test ./...
+
+      # race detector 需要 cgo，ubuntu runner 自带 gcc，不用像本机那样配 CC。
+      - name: test -race
+        run: go test -race ./...

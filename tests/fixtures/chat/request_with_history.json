@@ -1,0 +1,63 @@
+{
+  "model": "gpt-4o",
+  "messages": [
+    {
+      "role": "user",
+      "content": "旧金山和东京现在天气怎么样？"
+    },
+    {
+      "role": "assistant",
+      "content": null,
+      "tool_calls": [
+        {
+          "id": "call_aBc123",
+          "type": "function",
+          "function": {
+            "name": "get_weather",
+            "arguments": "{\"city\":\"San Francisco\",\"unit\":\"celsius\"}"
+          }
+        },
+        {
+          "id": "call_dEf456",
+          "type": "function",
+          "function": {
+            "name": "get_weather",
+            "arguments": "{\"city\":\"Tokyo\",\"unit\":\"celsius\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "tool_call_id": "call_aBc123",
+      "content": "{\"temp\":18,\"condition\":\"多云\"}"
+    },
+    {
+      "role": "tool",
+      "tool_call_id": "call_dEf456",
+      "content": "{\"temp\":24,\"condition\":\"晴\"}"
+    }
+  ],
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "get_weather",
+        "description": "查询指定城市的当前天气",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "city": {
+              "type": "string"
+            },
+            "unit": {
+              "type": "string",
+              "enum": ["celsius", "fahrenheit"]
+            }
+          },
+          "required": ["city"]
+        }
+      }
+    }
+  ]
+}

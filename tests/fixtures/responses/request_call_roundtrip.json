@@ -1,0 +1,57 @@
+{
+  "model": "gpt-4o",
+  "previous_response_id": "resp_68a1b2c3d4e5f6",
+  "input": [
+    {
+      "role": "user",
+      "content": "旧金山和东京现在天气怎么样？"
+    },
+    {
+      "type": "function_call",
+      "id": "fc_68a1aaa1111",
+      "call_id": "call_9kL2mN4pQ",
+      "name": "get_weather",
+      "arguments": "{\"city\":\"San Francisco\",\"unit\":\"celsius\"}"
+    },
+    {
+      "type": "function_call",
+      "id": "fc_68a1bbb2222",
+      "call_id": "call_7xY8zA1bC",
+      "name": "get_weather",
+      "arguments": "{\"city\":\"Tokyo\",\"unit\":\"celsius\"}"
+    },
+    {
+      "type": "function_call_output",
+      "call_id": "call_9kL2mN4pQ",
+      "output": "{\"temp\":18,\"condition\":\"多云\"}"
+    },
+    {
+      "type": "function_call_output",
+      "call_id": "call_7xY8zA1bC",
+      "output": "{\"temp\":24,\"condition\":\"晴\"}"
+    },
+    {
+      "role": "assistant",
+      "content": "旧金山 18 度多云，东京 24 度晴。"
+    }
+  ],
+  "tools": [
+    {
+      "type": "function",
+      "name": "get_weather",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "city": {
+            "type": "string"
+          },
+          "unit": {
+            "type": "string",
+            "enum": ["celsius", "fahrenheit"]
+          }
+        },
+        "required": ["city"]
+      }
+    }
+  ]
+}

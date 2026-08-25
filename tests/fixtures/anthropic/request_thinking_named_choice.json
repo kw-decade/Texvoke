@@ -1,0 +1,41 @@
+{
+  "model": "claude-sonnet-5",
+  "max_tokens": 4096,
+  "system": [
+    {
+      "type": "text",
+      "text": "你是一个图像描述助手。"
+    }
+  ],
+  "messages": [
+    {
+      "role": "assistant",
+      "content": [
+        {
+          "type": "thinking",
+          "thinking": "用户想知道图里有什么，我应该调用描述工具。",
+          "signature": "ErUBCkYIBBgCIkAyy7Z0"
+        },
+        {
+          "type": "text",
+          "text": "让我看看这张图。"
+        }
+      ]
+    }
+  ],
+  "tools": [
+    {
+      "name": "describe_image",
+      "input_schema": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+      }
+    }
+  ],
+  "tool_choice": {
+    "type": "tool",
+    "name": "describe_image",
+    "disable_parallel_tool_use": true
+  }
+}

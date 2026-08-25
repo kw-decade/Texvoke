@@ -1,0 +1,37 @@
+{
+  "content": [
+    {
+      "text": "我来分别查一下这两个城市。",
+      "type": "text"
+    },
+    {
+      "id": "toolu_01A09q90qw90lkasdjl",
+      "input": {
+        "city": "San Francisco",
+        "unit": "celsius"
+      },
+      "name": "get_weather",
+      "type": "tool_use"
+    },
+    {
+      "id": "toolu_02B18r81rx81mlbtekm",
+      "input": {
+        "city": "Tokyo",
+        "unit": "celsius"
+      },
+      "name": "get_weather",
+      "type": "tool_use"
+    }
+  ],
+  "id": "msg_01fixture",
+  "model": "claude-sonnet-5",
+  "role": "assistant",
+  "stop_reason": "tool_use",
+  "stop_sequence": null,
+  "type": "message",
+  "usage": {
+    "cache_read_input_tokens": 256,
+    "input_tokens": 384,
+    "output_tokens": 96
+  }
+}
