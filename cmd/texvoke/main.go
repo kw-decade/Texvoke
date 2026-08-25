@@ -28,6 +28,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"strings"
@@ -238,6 +239,30 @@ func buildAdapter(format, endpointURL, apiKey string) (upstream.Adapter, error) 
 	default:
 		return nil, fmt.Errorf("未知 format %q（当前支持 openai-chat）", format)
 	}
+}
+
+// proxiedClient 返回尊重 HTTPS_PROXY 环境变量的 HTTP 客户端。
+//
+// http.DefaultClient 不读代理环境变量，而不少上游按出口 IP 做地区风控——
+// 浏览器能访问（走了系统代理）、服务端直连被 403 拒绝，症状是「同一台机器
+// 网页能用、网关报 Country not supported」。需要代理出口的适配器用它。
+// 无代理配置时等价于直连。
+func proxiedClient() *http.Client {
+	proxyURL := os.Getenv("HTTPS_PROXY")
+	if proxyURL == "" {
+		proxyURL = os.Getenv("https_proxy")
+	}
+	if proxyURL == "" {
+		proxyURL = os.Getenv("ALL_PROXY")
+	}
+	if proxyURL == "" {
+		return &http.Client{}
+	}
+	u, err := url.Parse(proxyURL)
+	if err != nil {
+		return &http.Client{}
+	}
+	return &http.Client{Transport: &http.Transport{Proxy: http.ProxyURL(u)}}
 }
 
 func splitList(s string) []string {
