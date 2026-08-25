@@ -44,4 +44,11 @@ type Adapter interface {
 	// 表示客户端是否要求流式体验：伪流式架构下所有上游都按非流式取回
 	// 全文，这个参数只留给个别支持同步整段返回的上游做提示。
 	Complete(ctx context.Context, model string, messages []protocol.Message) (Reply, error)
+
+	// Models 返回上游可用的模型名清单。
+	//
+	// 网关对模型是透明的：客户端问有哪些模型，答案来自上游而不是网关编的。
+	// 有的自定义上游没有这个概念（payload 里 model 只是标签），实现可以
+	// 返回配置时写死的那个名字。
+	Models(ctx context.Context) ([]string, error)
 }

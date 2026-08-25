@@ -111,6 +111,52 @@ func (c OpenAIChat) Complete(ctx context.Context, model string, messages []proto
 	return Reply{Text: text, Status: resp.StatusCode}, nil
 }
 
+// Models 拉上游的 /models 清单。网关对模型名是透明的：客户端问有哪些模型，
+// 答案应该来自上游，而不是网关编一个。
+func (c OpenAIChat) Models(ctx context.Context) ([]string, error) {
+	endpoint := strings.TrimSuffix(c.Endpoint, "/")
+	// endpoint 可能写到 /chat/completions 为止；模型清单在同源的 /models。
+	if i := strings.LastIndex(endpoint, "/chat/completions"); i > 0 {
+		endpoint = endpoint[:i]
+	}
+	if !strings.HasSuffix(endpoint, "/models") {
+		endpoint += "/models"
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, fmt.Errorf("upstream: 构造请求失败：%w", err)
+	}
+	if c.APIKey != "" {
+		req.Header.Set("authorization", "Bearer "+c.APIKey)
+	}
+
+	resp, err := c.client().Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("upstream: 连接失败：%w", err)
+	}
+	defer resp.Body.Close()
+	data, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode != http.StatusOK {
+		return nil, classifyHTTPError(resp.StatusCode, data)
+	}
+	var parsed struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(data, &parsed); err != nil {
+		return nil, fmt.Errorf("upstream: 解析 models 响应失败：%w", err)
+	}
+	out := make([]string, 0, len(parsed.Data))
+	for _, m := range parsed.Data {
+		if m.ID != "" {
+			out = append(out, m.ID)
+		}
+	}
+	return out, nil
+}
+
 // accumulateChatStream 读完整条 SSE 流并拼出模型文本。
 func accumulateChatStream(r io.Reader) (string, error) {
 	acc := protocol.NewChatStreamAccumulator(protocol.DecodeOptions{})

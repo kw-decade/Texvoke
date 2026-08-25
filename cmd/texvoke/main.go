@@ -114,6 +114,7 @@ func main() {
 	mux.HandleFunc("POST /v1/chat/completions", handle(gw, logger, "chat"))
 	mux.HandleFunc("POST /v1/messages", handle(gw, logger, "anthropic"))
 	mux.HandleFunc("POST /v1/responses", handle(gw, logger, "responses"))
+	mux.HandleFunc("GET /v1/models", listModels(adapter, logger))
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{"status":"ok"}`))
@@ -184,6 +185,40 @@ func handle(gw *gateway.Gateway, log *slog.Logger, proto string) http.HandlerFun
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write(out)
+	}
+}
+
+// listModels 透传上游的模型清单。CC Switch 这类路由工具在添加供应商时
+// 会先拉一次列表；答案来自上游（Adapter.Models），网关不编造名字。
+//
+// 响应形状照抄 OpenAI：data 里每个元素是完整对象而不是裸字符串——有的
+// 客户端按 m.id 取值，给字符串会让它静默失败。CORS 头同理：路由工具多半
+// 是 Electron/浏览器内核，缺 access-control-allow-origin 时请求在渲染层
+// 就被拦掉，表现为「获取不到模型」而服务端日志一片干净。上游查询失败时
+// 回 502——装作有模型会让客户端在第一次请求时才炸，不如现在就说清楚。
+func listModels(ad upstream.Adapter, log *slog.Logger) http.HandlerFunc {
+	return func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		names, err := ad.Models(context.Background())
+		if err != nil {
+			log.Warn("拉取上游模型清单失败", "error", err.Error())
+			writeErr(w, http.StatusBadGateway, "上游模型清单不可用："+err.Error())
+			return
+		}
+		models := make([]map[string]any, len(names))
+		for i, n := range names {
+			models[i] = map[string]any{
+				"id": n, "object": "model",
+				"created": time.Now().Unix(), "owned_by": "texvoke",
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(map[string]any{
+			"object": "list",
+			"data":   models,
+		}); err != nil {
+			return
+		}
 	}
 }
 

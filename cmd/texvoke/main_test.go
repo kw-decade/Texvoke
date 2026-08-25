@@ -30,6 +30,10 @@ func (f fakeUpstream) Complete(context.Context, string, []protocol.Message) (ups
 	return upstream.Reply{Text: f.text, Status: 200}, nil
 }
 
+func (f fakeUpstream) Models(context.Context) ([]string, error) {
+	return []string{"fake-model"}, nil
+}
+
 func testGateway(t *testing.T) *gateway.Gateway {
 	t.Helper()
 	br, err := toolbridge.New(toolbridge.Config{})

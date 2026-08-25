@@ -37,6 +37,9 @@ type mockAdapter struct {
 
 func (m *mockAdapter) Name() string { return "mock" }
 
+// Models 满足 Adapter 接口；编排循环不查模型清单，测试里给个占位。
+func (m *mockAdapter) Models(context.Context) ([]string, error) { return []string{"mock-model"}, nil }
+
 func (m *mockAdapter) Complete(ctx context.Context, model string, messages []protocol.Message) (upstream.Reply, error) {
 	i := int(m.calls.Load())
 	m.calls.Add(1)
@@ -124,6 +127,8 @@ type signalAdapter struct {
 }
 
 func (s *signalAdapter) Name() string { return "signal" }
+
+func (s *signalAdapter) Models(context.Context) ([]string, error) { return []string{"mock-model"}, nil }
 
 func (s *signalAdapter) Complete(ctx context.Context, model string, messages []protocol.Message) (upstream.Reply, error) {
 	n := s.calls.Add(1)
@@ -284,6 +289,10 @@ type alwaysRefuseAdapter struct {
 
 func (a *alwaysRefuseAdapter) Name() string { return "refuse" }
 
+func (a *alwaysRefuseAdapter) Models(context.Context) ([]string, error) {
+	return []string{"mock-model"}, nil
+}
+
 func (a *alwaysRefuseAdapter) Complete(ctx context.Context, model string, messages []protocol.Message) (upstream.Reply, error) {
 	a.calls.Add(1)
 	return upstream.Reply{Text: "抱歉，我没有工具可用，请你自己在终端里执行这个命令。", Status: 200}, nil
@@ -418,6 +427,10 @@ type slowRefuseAdapter struct {
 }
 
 func (s *slowRefuseAdapter) Name() string { return "slow" }
+
+func (s *slowRefuseAdapter) Models(context.Context) ([]string, error) {
+	return []string{"mock-model"}, nil
+}
 
 func (s *slowRefuseAdapter) Complete(ctx context.Context, _ string, _ []protocol.Message) (upstream.Reply, error) {
 	if s.calls.Add(1) == 1 {
