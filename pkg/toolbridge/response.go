@@ -107,8 +107,12 @@ func (s *Session) NewStreamRenderer(req *Request, w io.Writer, opts RenderOption
 
 // WriteText 收下一段文本增量并立即发给客户端。
 //
-// 第一个非空增量先触发协议起始事件。返回错误时流已损坏（写失败说明客户端
-// 断开），后续 Write 与 Finish 仍可调用但不会再写字节。
+// 第一个非空增量先触发协议起始事件。每次写完都 Flush——不 Flush 的话字节
+// 积在 net/http 的缓冲里等整个响应结束才一次性到达，那就是伪流式套了个
+// 流式的壳（2026-08-26 实测踩过：事件全挤在最后一刻）。
+//
+// 返回错误时流已损坏（写失败说明客户端断开），后续 Write 与 Finish 仍可
+// 调用但不会再写字节。
 func (sr *StreamRenderer) WriteText(b []byte) error {
 	if len(b) == 0 || sr.finished {
 		return nil
@@ -120,7 +124,10 @@ func (sr *StreamRenderer) WriteText(b []byte) error {
 		sr.streamed = true
 	}
 	sr.text = append(sr.text, b...)
-	return sr.delta(string(b))
+	if err := sr.delta(string(b)); err != nil {
+		return err
+	}
+	return sr.enc.Flush()
 }
 
 // begin 发出协议起始事件。只在第一个增量前调用一次。

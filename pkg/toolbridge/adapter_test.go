@@ -647,6 +647,38 @@ func TestStreamRendererFallsBackWhenNothingStreamed(t *testing.T) {
 	}
 }
 
+// 每个增量都必须 Flush。
+//
+// 2026-08-26 实测踩过：编码器只 Write 不 Flush，字节积在 net/http 的缓冲里
+// 等整个响应结束才一次性到达——客户端看到的事件全挤在最后一刻，真流式的
+// 全部收益归零，而所有单测照样绿（bytes.Buffer 没有缓冲概念）。所以这条
+// 断言必须用一个会数 Flush 次数的写入器。
+func TestStreamRendererFlushesEachDelta(t *testing.T) {
+	sess := newSession(t, Config{})
+	req, _ := DecodeRequest(ProtocolChat, []byte(chatBody), decodeOpts())
+	fw := &flushCountingWriter{}
+	sr, err := sess.NewStreamRenderer(req, fw, RenderOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sr.WriteText([]byte("一"))
+	sr.WriteText([]byte("二"))
+	sr.WriteText([]byte("三"))
+
+	if fw.flushes < 3 {
+		t.Fatalf("三个增量只 Flush 了 %d 次——字节会积在缓冲里，等于伪流式", fw.flushes)
+	}
+}
+
+// flushCountingWriter 数 Flush 调用次数，模拟 http.ResponseWriter 的行为。
+type flushCountingWriter struct {
+	buf     bytes.Buffer
+	flushes int
+}
+
+func (f *flushCountingWriter) Write(b []byte) (int, error) { return f.buf.Write(b) }
+func (f *flushCountingWriter) Flush()                      { f.flushes++ }
+
 func TestStreamRendererFinishIsIdempotent(t *testing.T) {
 	sess := newSession(t, Config{})
 	req, _ := DecodeRequest(ProtocolChat, []byte(chatBody), decodeOpts())

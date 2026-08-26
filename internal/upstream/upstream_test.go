@@ -123,6 +123,78 @@ func TestOpenAIChatModelsUpstreamError(t *testing.T) {
 	}
 }
 
+// TestOpenAIChatCompleteStreamDelivers 钉住真流式的交付语义：
+// 每个内容增量按到达顺序交给 onChunk，且拼接等于最终文本。
+//
+// 这条测试的价值在于「等于」——交付的碎片与 Reply.Text 不一致的话，
+// 客户端屏幕上的内容与网关解析用的内容就分叉了（不变量 8）。
+func TestOpenAIChatCompleteStreamDelivers(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "text/event-stream")
+		f := w.(http.Flusher)
+		for _, c := range []string{
+			`data: {"id":"c1","model":"m","choices":[{"index":0,"delta":{"role":"assistant"}}]}` + "\n\n",
+			`data: {"id":"c1","choices":[{"index":0,"delta":{"content":"第一"}}]}` + "\n\n",
+			`data: {"id":"c1","choices":[{"index":0,"delta":{"content":"第二"}}]}` + "\n\n",
+			`data: {"id":"c1","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}` + "\n\n",
+			"data: [DONE]\n\n",
+		} {
+			_, _ = w.Write([]byte(c))
+			f.Flush()
+		}
+	}))
+	defer srv.Close()
+
+	var got []string
+	ad := OpenAIChat{Endpoint: srv.URL}
+	reply, err := ad.CompleteStream(context.Background(), "m", chatMessages(),
+		func(chunk []byte) error {
+			got = append(got, string(chunk))
+			return nil
+		})
+	if err != nil {
+		t.Fatalf("CompleteStream 失败：%v", err)
+	}
+	if len(got) != 2 || got[0] != "第一" || got[1] != "第二" {
+		t.Fatalf("交付的增量 = %#v，期望逐段 [第一 第二]", got)
+	}
+	if joined := strings.Join(got, ""); joined != reply.Text {
+		t.Fatalf("增量拼接 %q 与最终文本 %q 不一致", joined, reply.Text)
+	}
+	// role 首包与 finish_reason 尾包不带正文，不该产生空交付。
+	for _, c := range got {
+		if c == "" {
+			t.Error("交付了空增量")
+		}
+	}
+}
+
+// onChunk 返回错误即中止读流，并把已收到的文本交回来。
+// 场景：客户端断开，网关不再需要后续字节。
+func TestOpenAIChatCompleteStreamStopsOnHandlerError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "text/event-stream")
+		f := w.(http.Flusher)
+		for i := 0; i < 5; i++ {
+			_, _ = w.Write([]byte(`data: {"id":"c1","choices":[{"index":0,"delta":{"content":"x"}}]}` + "\n\n"))
+			f.Flush()
+		}
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer srv.Close()
+
+	stop := errors.New("客户端断开")
+	ad := OpenAIChat{Endpoint: srv.URL}
+	reply, err := ad.CompleteStream(context.Background(), "m", chatMessages(),
+		func(chunk []byte) error { return stop })
+	if !errors.Is(err, stop) {
+		t.Fatalf("应把 handler 的错误原样交回，得到 %v", err)
+	}
+	if reply.Text != "x" {
+		t.Fatalf("中止时应交回已收到的文本，得到 %q", reply.Text)
+	}
+}
+
 func TestOpenAIChatUpstreamError(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusForbidden)
@@ -191,7 +263,7 @@ func TestAccumulateChatStreamKeepsPartialTextOnTransportError(t *testing.T) {
 		`data: {"id":"c1","choices":[{"index":0,"delta":{"content":"的半截"}}]}` + "\n\n"
 	r := &errAfterReader{r: strings.NewReader(body), err: errors.New("connection reset by peer")}
 
-	text, err := accumulateChatStream(r)
+	text, err := accumulateChatStream(r, nil)
 	if err == nil {
 		t.Fatal("传输层报错必须显式失败")
 	}

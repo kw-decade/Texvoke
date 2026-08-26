@@ -72,6 +72,17 @@ func (c OpenAIChat) timeout() time.Duration {
 // Complete 实现Adapter。请求体由 protocol.EncodeChatRequest 生成——它已经
 // 处理了 content 压平与字段收窄，这里不重复造轮子。
 func (c OpenAIChat) Complete(ctx context.Context, model string, messages []protocol.Message) (Reply, error) {
+	return c.CompleteStream(ctx, model, messages, nil)
+}
+
+// CompleteStream 实现 StreamWriter：把上游的每个内容增量按到达顺序交给
+// onChunk，同时仍返回完整文本。
+//
+// onChunk 为 nil 时行为与 Complete 完全一致——两条路径共用同一段读流逻辑，
+// 避免「流式能跑、非流式坏了」这类分叉。
+func (c OpenAIChat) CompleteStream(ctx context.Context, model string, messages []protocol.Message,
+	onChunk StreamHandler) (Reply, error) {
+
 	body, err := protocol.EncodeChatRequest(protocol.ChatRequest{
 		Model:    model,
 		Messages: messages,
@@ -104,7 +115,7 @@ func (c OpenAIChat) Complete(ctx context.Context, model string, messages []proto
 		return Reply{Status: resp.StatusCode}, classifyHTTPError(resp.StatusCode, snippet)
 	}
 
-	text, err := accumulateChatStream(resp.Body)
+	text, err := accumulateChatStream(resp.Body, onChunk)
 	if err != nil {
 		// 断流前已累积的文本跟着错误一起交回去。accumulateChatStream 特意
 		// 保留了它，这里丢掉就等于白留——调用方靠它做降级透传。
@@ -163,9 +174,30 @@ func (c OpenAIChat) Models(ctx context.Context) ([]string, error) {
 //
 // 流中断时返回已收到的部分文本 + 错误——断前的内容不该跟着断流一起消失，
 // 调用方（gateway）拿它做降级透传。完整成功时 error 为 nil。
-func accumulateChatStream(r io.Reader) (string, error) {
+//
+// onChunk 非 nil 时每收到一段内容增量就交付一次（真流式）。交付的是
+// **本次新增的正文字节**，不含 tool_calls 增量——那些要累积完才有意义，
+// 由 Result 一次性给出。onChunk 返回错误即中止读流：调用方不要了。
+func accumulateChatStream(r io.Reader, onChunk StreamHandler) (string, error) {
 	acc := protocol.NewChatStreamAccumulator(protocol.DecodeOptions{})
 	dec := protocol.NewSSEDecoder(bufio.NewReaderSize(r, 64<<10), protocol.SSEDecoderOptions{})
+
+	// delivered 是已交付给 onChunk 的正文字节数。用累积器的 PartialText
+	// 做差而不是自己解析 chunk：正文的还原规则（增量拼接、多 choice 拒绝、
+	// refusal 分流）全在累积器里，在这里重做一遍必然分叉。
+	delivered := 0
+	deliver := func() error {
+		if onChunk == nil {
+			return nil
+		}
+		full := acc.PartialText()
+		if len(full) <= delivered {
+			return nil
+		}
+		next := full[delivered:]
+		delivered = len(full)
+		return onChunk([]byte(next))
+	}
 
 	// 卡死保护：SSEDecoder 阻塞在读上，用定时器在无数据时放弃整条流。
 	// 包一层实现「每收到一个事件就续期」的效果——简单做法是给底层 reader
@@ -181,6 +213,9 @@ func accumulateChatStream(r io.Reader) (string, error) {
 		}
 		if err := acc.Add(*ev); err != nil {
 			return acc.PartialText(), fmt.Errorf("upstream: %w", err)
+		}
+		if err := deliver(); err != nil {
+			return acc.PartialText(), err
 		}
 		if acc.Done() {
 			break
