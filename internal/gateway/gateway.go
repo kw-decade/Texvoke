@@ -26,6 +26,7 @@ import (
 	"io"
 	"log/slog"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/kw-decade/Texvoke/internal/observability"
@@ -207,7 +208,8 @@ func (g *Gateway) Handle(ctx context.Context, protocolName string, body []byte) 
 		"tools_included", len(compiled.ToolsIncluded))
 
 	// ---- 上游调用 → 解析 → 救援循环 ----
-	res := g.loop(ctx, sess, decoded, sk, compiled.ToolsIncluded)
+	// 非流式路径不需要增量交付：客户端等的是一个完整 JSON 响应体。
+	res := g.loop(ctx, sess, decoded, sk, compiled.ToolsIncluded, nil)
 
 	// ---- render：无论救援走到哪一步，都要渲染回客户端协议 ----
 	out, err := g.render(sess, decoded, res, clientModel)
@@ -263,15 +265,26 @@ func (g *Gateway) adapt(proto toolbridge.Protocol, sessionID, requestID string, 
 //
 // 返回的 Result 永远非 nil：任何异常路径都降级成纯文本透传，
 // 绝不让调用方拿到空指针——这是前身实现三类事故里最痛的一类。
+//
+// onChunk 非 nil 时走真流式：每一轮上游调用的原始增量都交给它（由调用方
+// 经 StreamParser 过滤后转发给客户端）。阶梯追问轮同样交付——客户端看到的
+// 是各轮叙述的自然拼接，与「失败回应回灌进历史」同构。
+//
+// newHandler 在每轮开始时被调用一次，返回该轮的增量接收器（可以是 nil，
+// 表示这一轮不做增量交付）。传 nil 表示整条循环都不做流式。
 func (g *Gateway) loop(ctx context.Context, sess *toolbridge.Session, decoded *toolbridge.Request,
-	sk string, toolsIncluded []string) *toolbridge.Result {
+	sk string, toolsIncluded []string, newHandler func() upstream.StreamHandler) *toolbridge.Result {
 
 	// last 保留上一轮已经拿到的结果。上游中途失败或墙钟预算耗尽时把它交出去，
 	// 而不是丢掉重来——阶梯第三轮挂掉不该让前两轮的文本一起消失。
 	var last *toolbridge.Result
 
 	for round := 0; round < maxRecoverRounds; round++ {
-		text, uerr := g.completeWithRetry(ctx, decoded.Model(), decoded.Messages())
+		var onChunk upstream.StreamHandler
+		if newHandler != nil {
+			onChunk = newHandler()
+		}
+		text, uerr := g.completeWithRetry(ctx, decoded.Model(), decoded.Messages(), onChunk)
 		if uerr != nil {
 			// 上游彻底不可用（含永久性错误与预算耗尽）。降级顺序：
 			// 断流前的部分文本 → 上一轮的完整结果 → 空文本的 plain_text。
@@ -401,9 +414,29 @@ func (g *Gateway) recover(sess *toolbridge.Session, decoded *toolbridge.Request,
 // 返回值约定：错误时 string 尽量非空——上游断流前已经吐出的部分文本
 // 跟着错误一起交回来，调用方拿它降级透传，而不是让用户等完一整轮
 // 重生成再从零开始。
-func (g *Gateway) completeWithRetry(ctx context.Context, model string, messages []protocol.Message) (string, error) {
+//
+// onChunk 非 nil 时走真流式：适配器实现了 StreamWriter 就边收边交付，
+// 没实现就回落到 Complete 后一次性交付（客户端仍是流式事件，只是没有
+// 逐字节奏）。
+//
+// **已经交付过字节之后不再重试**：那些字节已经在客户端屏幕上，重试会让
+// 同一段内容出现两遍。这不是保守，是流式的物理约束。
+func (g *Gateway) completeWithRetry(ctx context.Context, model string, messages []protocol.Message,
+	onChunk upstream.StreamHandler) (string, error) {
+
 	var lastErr error
 	var lastPartial string
+	emitted := false
+	wrapped := onChunk
+	if onChunk != nil {
+		wrapped = func(chunk []byte) error {
+			if len(chunk) > 0 {
+				emitted = true
+			}
+			return onChunk(chunk)
+		}
+	}
+
 	for attempt := 0; attempt <= maxUpstreamRetries; attempt++ {
 		// 预算耗尽或客户端断开时立刻停手。这一步不能省：http.Client 的超时
 		// 错误文本里带 timeout，会被 isTransient 判成瞬态，于是一个已经没人
@@ -414,7 +447,7 @@ func (g *Gateway) completeWithRetry(ctx context.Context, model string, messages 
 			}
 			return "", err
 		}
-		reply, err := g.cfg.Adapter.Complete(ctx, model, messages)
+		reply, err := g.complete(ctx, model, messages, wrapped)
 		if err == nil {
 			if strings.TrimSpace(reply.Text) != "" {
 				return reply.Text, nil
@@ -432,11 +465,36 @@ func (g *Gateway) completeWithRetry(ctx context.Context, model string, messages 
 				return reply.Text, err
 			}
 		}
+		if emitted {
+			// 已经发给客户端的内容收不回来，重试等于让它看到两遍。
+			g.log.Warn("已交付流式字节，放弃重试", "error", lastErr.Error())
+			return lastPartial, lastErr
+		}
 		if attempt < maxUpstreamRetries {
 			g.log.Warn("上游瞬态故障，重试", "attempt", attempt+1, "error", lastErr.Error())
 		}
 	}
 	return lastPartial, lastErr
+}
+
+// complete 按 onChunk 是否为 nil 与适配器能力选调用方式。
+func (g *Gateway) complete(ctx context.Context, model string, messages []protocol.Message,
+	onChunk upstream.StreamHandler) (upstream.Reply, error) {
+
+	if onChunk != nil {
+		if sw, ok := g.cfg.Adapter.(upstream.StreamWriter); ok {
+			return sw.CompleteStream(ctx, model, messages, onChunk)
+		}
+		// 适配器不支持流式：拿到全文后一次性交付，客户端事件形状不变。
+		reply, err := g.cfg.Adapter.Complete(ctx, model, messages)
+		if reply.Text != "" {
+			if cerr := onChunk([]byte(reply.Text)); cerr != nil && err == nil {
+				err = cerr
+			}
+		}
+		return reply, err
+	}
+	return g.cfg.Adapter.Complete(ctx, model, messages)
 }
 
 // isTransient 判断上游错误是否值得重试。与前身实现的正则同源：
@@ -460,12 +518,13 @@ func isTransient(err error) bool {
 
 // heartbeat 在伪流式的等待期里定期写 SSE 注释帧保活。
 //
-// 停止是同步的：Stop 返回后保证不会再有心跳写入 w。所以调用方不需要为
-// 「心跳与真实事件同时写」加锁——把 Stop 放在渲染器动笔之前就够了。
-// 少一把锁少一类交错 bug。
+// 停止是同步且幂等的：Stop 返回后保证不会再有心跳写入 w，重复调用无副作用。
+// 所以调用方不需要为「心跳与真实事件同时写」加锁——真流式下在第一个增量
+// 到达时停一次、循环结束再兜一次，两次都安全。少一把锁少一类交错 bug。
 type heartbeat struct {
 	stop chan struct{}
 	done chan struct{}
+	once sync.Once
 }
 
 // startHeartbeat 起一个心跳协程。every 为 0 取默认间隔，负值直接关掉。
@@ -503,9 +562,9 @@ func startHeartbeat(w io.Writer, every time.Duration) *heartbeat {
 	return h
 }
 
-// Stop 停掉心跳并等它真的停下。只能调用一次。
+// Stop 停掉心跳并等它真的停下。幂等：重复调用直接返回。
 func (h *heartbeat) Stop() {
-	close(h.stop)
+	h.once.Do(func() { close(h.stop) })
 	<-h.done
 }
 
@@ -516,13 +575,25 @@ func (g *Gateway) render(sess *toolbridge.Session, decoded *toolbridge.Request, 
 }
 
 // HandleSSE 是 Handle 的流式版本：把结果渲染成客户端协议的 SSE 事件序列
-// 写进 w。事件形状完全正确（该有的 message_stop / [DONE] 一个不少），
-// 但第一个字要等上游说完——伪流式与闭环恢复互斥，这是当前架构的自觉取舍。
+// 写进 w。
 //
-// 等待期不是静默的：心跳写 SSE 注释帧保住连接，否则客户端会在服务端仍在
-// 正常工作时先超时断开。
+// **真流式**：上游吐出的字节经 StreamParser 判定「确定不是协议信号」之后
+// 立刻转成客户端协议的增量事件发出。客户端看到的是逐段到达的文本，而不是
+// 等整轮说完的一次性投递。
 //
-// 与 Handle 共用同一条编排循环；差异只在最后的渲染出口。
+// 与闭环恢复的关系（这曾被判为互斥，实际不是）：协议说明教模型「先输出
+// 信号再写 envelope」，所以打算调用时信号出现在最前面，StreamParser 从
+// 信号起扣住全部字节——envelope 的任何片段都不会漏给客户端。模型在叙述时
+// 全文都是安全文本，实时透传。阶梯追问轮同样边收边发，客户端看到的是
+// 各轮叙述的自然拼接，与「失败回应回灌进历史」同构。
+//
+// 已交付的字节收不回来，所以两条纪律必须守住：
+//   - 交付过字节之后不再做瞬态重试（见 completeWithRetry）
+//   - 渲染器不重发文本，Finish 只补工具调用与终止事件
+//
+// 等待期（连接建立到第一个增量之间，上游排队时仍可能有几秒）由心跳兜底。
+//
+// 与 Handle 共用同一条编排循环；差异只在交付方式与渲染出口。
 func (g *Gateway) HandleSSE(ctx context.Context, protocolName string, body []byte, w io.Writer) error {
 	proto := toolbridge.Protocol(protocolName)
 	if !proto.Valid() {
@@ -539,17 +610,62 @@ func (g *Gateway) HandleSSE(ctx context.Context, protocolName string, body []byt
 		return err
 	}
 
-	// 从这里开始要等上游。心跳上岗，渲染器动笔之前必须停掉——Stop 是同步的，
-	// 返回后 w 又归渲染器独占，不需要锁。
-	hb := startHeartbeat(w, g.cfg.HeartbeatInterval)
-	res := g.loop(ctx, sess, decoded, sk, compiled.ToolsIncluded)
-	hb.Stop()
-
 	sr, err := sess.NewStreamRenderer(decoded, w, toolbridge.RenderOptions{Model: clientModel})
 	if err != nil {
 		return fmt.Errorf("gateway: 建立流式渲染失败：%w", err)
 	}
-	if err := sr.Finish(*res); err != nil {
+
+	// 心跳只覆盖「连接建立到第一个增量」的空窗。第一个增量到达前必须停掉：
+	// 之后 w 归渲染器独占，两个 goroutine 同时写同一个 writer 是数据竞争。
+	// Stop 是同步且幂等的，所以这里停一次、loop 之后再兜一次都安全。
+	hb := startHeartbeat(w, g.cfg.HeartbeatInterval)
+	defer hb.Stop()
+
+	// streamed 记下客户端实际收到的全部文本——收尾时用它作为 Result.Text
+	// 的权威值（不变量 8：增量与终态必须一致）。
+	var streamed strings.Builder
+	var writeErr error
+
+	// 每一轮上游调用配一个新的 StreamParser：跨轮复用会把上一轮的半截
+	// 状态带进来。newHandler 在每轮开始时被 loop 调用。
+	newHandler := func() upstream.StreamHandler {
+		sp, err := sess.NewStreamParser()
+		if err != nil {
+			// 建不出解析器就本轮不做增量交付：文本仍会在收尾时一次性发出，
+			// 不损失内容。
+			g.log.Warn("流式解析器创建失败，本轮回落一次性渲染", "error", err.Error())
+			return nil
+		}
+		return func(chunk []byte) error {
+			if writeErr != nil {
+				return writeErr
+			}
+			safe, _ := sp.Write(chunk)
+			// 解析错误不在这里处理：整轮结束后由 loop 的 Parse 统一判定，
+			// 那条路径有降级纪律（不变量 16）。这里只管交付安全字节。
+			if len(safe) == 0 {
+				return nil
+			}
+			hb.Stop() // 渲染器要动笔了，心跳让位
+			streamed.Write(safe)
+			if err := sr.WriteText(safe); err != nil {
+				// 写失败说明客户端断开：记下来让适配器尽快停手。
+				writeErr = err
+				return err
+			}
+			return nil
+		}
+	}
+
+	res := g.loop(ctx, sess, decoded, sk, compiled.ToolsIncluded, newHandler)
+	hb.Stop()
+
+	final := *res
+	if streamed.Len() > 0 {
+		// 客户端已经收到这些字节，终态必须与它们一致。
+		final.Text = streamed.String()
+	}
+	if err := sr.Finish(final); err != nil {
 		return fmt.Errorf("gateway: 渲染 SSE 失败：%w", err)
 	}
 	return nil

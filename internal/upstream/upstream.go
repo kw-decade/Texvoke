@@ -52,3 +52,23 @@ type Adapter interface {
 	// 返回配置时写死的那个名字。
 	Models(ctx context.Context) ([]string, error)
 }
+
+// StreamHandler 接收模型输出的一段原始增量。chunk 的内容未经任何协议
+// 判断——增量解析是调用方（gateway → StreamParser）的职责。返回错误表示
+// 下游不再需要数据，实现应当尽快停止读取并返回已累积的结果。
+type StreamHandler func(chunk []byte) error
+
+// StreamWriter 是支持真流式的 Adapter 可选扩展。
+//
+// 单独成接口而不是并进 Adapter：接口加方法会破坏全部既有实现（包括
+// 使用方自己的第三方适配器），而流式能力本质上是可选的——网关用类型断言
+// 探测，支持就走边收边发，不支持回落伪流式，行为都正确。
+//
+// 语义约束：onChunk 按到达顺序交付模型的原始输出片段；CompleteStream
+// 返回时，所有 onChunk 交付的字节拼接必须等于 Reply.Text（断流等异常路径
+// 例外——那时 Text 是断前已收到的部分，与已回调的内容一致）。ctx 取消时
+// 实现应立即停止并返回已收到的部分文本与错误。
+type StreamWriter interface {
+	CompleteStream(ctx context.Context, model string, messages []protocol.Message,
+		onChunk StreamHandler) (Reply, error)
+}

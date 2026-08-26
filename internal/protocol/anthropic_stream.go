@@ -425,24 +425,20 @@ func EncodeAnthropicStream(enc *SSEEncoder, r MessagesResponse) error {
 	if err := r.Validate(); err != nil {
 		return err
 	}
-
-	write := func(evType string, v any) error {
-		b, err := json.Marshal(v)
-		if err != nil {
-			return fmt.Errorf("protocol: 编码 %s 事件失败：%w", evType, err)
-		}
-		return enc.Write(Event{Type: evType, Data: b})
+	if err := EncodeAnthropicMessageStart(enc, r, startUsageOf(r)); err != nil {
+		return err
 	}
+	return encodeAnthropicBodyAndTail(enc, r, 0)
+}
 
-	startUsage := &AnthropicUsage{}
-	if r.Usage != nil {
-		startUsage = &AnthropicUsage{
-			InputTokens:              r.Usage.InputTokens,
-			CacheReadInputTokens:     r.Usage.CacheReadInputTokens,
-			CacheCreationInputTokens: r.Usage.CacheCreationInputTokens,
-		}
+// EncodeAnthropicMessageStart 渲染真流式的起始事件（message_start）。
+// 独立出来是因为真流式下它在第一个文本增量之前发出，与收尾相隔整个
+// 生成期。startUsage 允许调用方传 nil（取零值）。
+func EncodeAnthropicMessageStart(enc *SSEEncoder, r MessagesResponse, startUsage *AnthropicUsage) error {
+	if startUsage == nil {
+		startUsage = &AnthropicUsage{}
 	}
-	err := write(EventMessageStart, map[string]any{
+	b, err := json.Marshal(map[string]any{
 		"type": EventMessageStart,
 		"message": map[string]any{
 			"id":            r.ID,
@@ -456,10 +452,72 @@ func EncodeAnthropicStream(enc *SSEEncoder, r MessagesResponse) error {
 		},
 	})
 	if err != nil {
+		return fmt.Errorf("protocol: 编码 %s 事件失败：%w", EventMessageStart, err)
+	}
+	return enc.Write(Event{Type: EventMessageStart, Data: b})
+}
+
+// EncodeAnthropicStreamTail 渲染真流式的收尾段：content_block_stop →
+// tool_use 块 → message_delta → message_stop。skipText 为真时跳过文本
+// block 重发（增量已实时到达），但 **content_block_stop 必须发**——
+// start/stop 配对是 Anthropic 的硬约束，漏掉它客户端 SDK 直接报错。
+func EncodeAnthropicStreamTail(enc *SSEEncoder, r MessagesResponse, skipText bool) error {
+	if err := r.Validate(); err != nil {
 		return err
 	}
+	if !skipText {
+		return EncodeAnthropicStream(enc, r)
+	}
+	// 文本增量已按 index 0 发出，收尾从它的 stop 开始。
+	return encodeAnthropicTextStopAndTail(enc, r)
+}
 
+// encodeAnthropicTextStopAndTail 发出文本 block 的 stop 与后续全部内容。
+func encodeAnthropicTextStopAndTail(enc *SSEEncoder, r MessagesResponse) error {
+	write := func(evType string, v any) error {
+		b, err := json.Marshal(v)
+		if err != nil {
+			return fmt.Errorf("protocol: 编码 %s 事件失败：%w", evType, err)
+		}
+		return enc.Write(Event{Type: evType, Data: b})
+	}
+	hasText := len(r.Content) > 0 && string(r.Content) != "null"
 	index := 0
+	if hasText {
+		if err := write(EventContentBlockStop, map[string]any{
+			"type": EventContentBlockStop, "index": 0,
+		}); err != nil {
+			return err
+		}
+		index = 1
+	}
+	return encodeAnthropicToolCallsAndEnd(enc, r, write, index)
+}
+
+// startUsageOf 从响应里提取 message_start 用的 usage。
+func startUsageOf(r MessagesResponse) *AnthropicUsage {
+	if r.Usage == nil {
+		return &AnthropicUsage{}
+	}
+	return &AnthropicUsage{
+		InputTokens:              r.Usage.InputTokens,
+		CacheReadInputTokens:     r.Usage.CacheReadInputTokens,
+		CacheCreationInputTokens: r.Usage.CacheCreationInputTokens,
+	}
+}
+
+// encodeAnthropicBodyAndTail 渲染 message_start 之后的全部内容：
+// 文本 block → tool_use 块 → message_delta → message_stop。startIndex 是
+// 文本 block 的位置（完整渲染恒为 0）。
+func encodeAnthropicBodyAndTail(enc *SSEEncoder, r MessagesResponse, startIndex int) error {
+	write := func(evType string, v any) error {
+		b, err := json.Marshal(v)
+		if err != nil {
+			return fmt.Errorf("protocol: 编码 %s 事件失败：%w", evType, err)
+		}
+		return enc.Write(Event{Type: evType, Data: b})
+	}
+	index := startIndex
 
 	// 文本 block 在前，与非流式渲染保持一致的顺序。
 	if len(r.Content) > 0 && string(r.Content) != "null" {
@@ -498,6 +556,16 @@ func EncodeAnthropicStream(enc *SSEEncoder, r MessagesResponse) error {
 			index++
 		}
 	}
+
+	return encodeAnthropicToolCallsAndEnd(enc, r, write, index)
+}
+
+// encodeAnthropicToolCallsAndEnd 渲染 tool_use 块与结束事件。
+//
+// 两条路径共用（完整渲染与真流式收尾），index 由调用方给出——真流式下
+// 文本 block 已经占了 0 号位。
+func encodeAnthropicToolCallsAndEnd(enc *SSEEncoder, r MessagesResponse,
+	write func(string, any) error, index int) error {
 
 	if err := rejectFreeform("anthropic", r.ToolCalls); err != nil {
 		return err

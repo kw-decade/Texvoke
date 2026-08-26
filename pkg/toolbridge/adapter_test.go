@@ -575,7 +575,7 @@ func TestStreamRendererPerProtocol(t *testing.T) {
 			}
 			sr.WriteText([]byte("我来"))
 			sr.WriteText([]byte("查一下"))
-			if err := sr.Finish(Result{Outcome: OutcomePlainText}); err != nil {
+			if err := sr.Finish(Result{Text: "我来查一下", Outcome: OutcomePlainText}); err != nil {
 				t.Fatalf("收尾失败：%v", err)
 			}
 			s := buf.String()
@@ -584,25 +584,66 @@ func TestStreamRendererPerProtocol(t *testing.T) {
 					t.Errorf("缺 %q：%s", w, s)
 				}
 			}
-			// 增量攒起来的文本必须出现在最终事件里。
-			if !strings.Contains(s, "我来查一下") {
-				t.Errorf("文本丢了：%s", s)
+			// 真流式：两个增量各自成事件到达，不再等到 Finish 才一次性发。
+			for _, frag := range []string{"我来", "查一下"} {
+				if !strings.Contains(s, frag) {
+					t.Errorf("增量 %q 丢了：%s", frag, s)
+				}
+			}
+			// 不能把正文当成增量重发一遍——客户端会显示两遍。
+			//
+			// Responses 是例外且必须例外：它的 output_item.done 与
+			// response.completed 按协议必须带完整的 item 内容，客户端靠
+			// item_id 去重。所以只对增量事件计数。
+			deltas := strings.Count(s, `"delta":"查一下"`) +
+				strings.Count(s, `"content":"查一下"`) +
+				strings.Count(s, `"text":"查一下"`)
+			if deltas != 1 {
+				t.Errorf("正文增量出现 %d 次，应恰好一次：%s", deltas, s)
 			}
 		})
 	}
 }
 
-func TestStreamRendererPrefersResultText(t *testing.T) {
-	// Result 里已有文本时用它——那是解析器确认过的、去掉协议内容的版本。
+// 真流式下已发出的字节收不回来：Finish 不重发文本。
+//
+// 伪流式时代这条测试断言「Result.Text 优先」——那时文本只在 Finish 才发，
+// 用解析器确认过的版本是对的。改成真流式后语义反转：增量已经到客户端
+// 屏幕上了，再发一份 Result.Text 就是两份正文。调用方（gateway）的权威
+// 来源是同一个 StreamParser，两者本就一致。
+func TestStreamRendererDoesNotResendTextAfterStreaming(t *testing.T) {
 	sess := newSession(t, Config{})
 	req, _ := DecodeRequest(ProtocolChat, []byte(chatBody), decodeOpts())
 	var buf bytes.Buffer
 	sr, _ := sess.NewStreamRenderer(req, &buf, RenderOptions{})
 	sr.WriteText([]byte("原始增量"))
+	sr.Finish(Result{Text: "原始增量", Outcome: OutcomePlainText})
+
+	out := buf.String()
+	if strings.Count(out, "原始增量") != 1 {
+		t.Errorf("正文出现 %d 次，真流式下应恰好一次：%s",
+			strings.Count(out, "原始增量"), out)
+	}
+	if !strings.Contains(out, "[DONE]") {
+		t.Errorf("终止事件缺失：%s", out)
+	}
+}
+
+// 未流式过任何增量时（上游全程 envelope、或零输出），Finish 仍然一次性
+// 渲染完整序列——行为与伪流式时代一致。
+func TestStreamRendererFallsBackWhenNothingStreamed(t *testing.T) {
+	sess := newSession(t, Config{})
+	req, _ := DecodeRequest(ProtocolChat, []byte(chatBody), decodeOpts())
+	var buf bytes.Buffer
+	sr, _ := sess.NewStreamRenderer(req, &buf, RenderOptions{})
 	sr.Finish(Result{Text: "解析器给的文本", Outcome: OutcomePlainText})
 
-	if !strings.Contains(buf.String(), "解析器给的文本") {
-		t.Errorf("应优先用 Result.Text：%s", buf.String())
+	out := buf.String()
+	if !strings.Contains(out, "解析器给的文本") {
+		t.Errorf("未流式过时应发 Result.Text：%s", out)
+	}
+	if !strings.Contains(out, `"role":"assistant"`) {
+		t.Errorf("缺少 role 首包：%s", out)
 	}
 }
 

@@ -312,14 +312,7 @@ func EncodeChatStream(enc *SSEEncoder, r ChatResponse) error {
 	}
 
 	head := func(delta map[string]any, finish any) map[string]any {
-		choice := map[string]any{"index": 0, "delta": delta, "finish_reason": finish}
-		return map[string]any{
-			"id":      r.ID,
-			"object":  "chat.completion.chunk",
-			"created": r.Created,
-			"model":   r.Model,
-			"choices": []any{choice},
-		}
+		return newChatChunk(r, delta, finish)
 	}
 
 	write := func(v map[string]any) error {
@@ -352,6 +345,36 @@ func EncodeChatStream(enc *SSEEncoder, r ChatResponse) error {
 		}
 	}
 
+	return encodeChatTail(enc, r)
+}
+
+// EncodeChatStreamTail 渲染真流式的收尾段：tool_calls → finish_reason →
+// usage → [DONE]。skipText 为真时跳过 content/refusal 重发——那些增量已经
+// 实时到达，重复会让客户端看到两份正文。
+//
+// 事件形状与 EncodeChatStream 的对应段落逐一相同（同一个 head 构造器），
+// 分叉即 bug。
+func EncodeChatStreamTail(enc *SSEEncoder, r ChatResponse, skipText bool) error {
+	if err := r.Validate(); err != nil {
+		return err
+	}
+	if !skipText {
+		// 未流式过：完整渲染（含首包与文本）。
+		return EncodeChatStream(enc, r)
+	}
+	return encodeChatTail(enc, r)
+}
+
+// encodeChatTail 是两条路径共用的 Chat 收尾段。
+func encodeChatTail(enc *SSEEncoder, r ChatResponse) error {
+	write := func(v map[string]any) error {
+		b, err := json.Marshal(v)
+		if err != nil {
+			return fmt.Errorf("protocol: 编码 chunk 失败：%w", err)
+		}
+		return enc.Write(Event{Data: b})
+	}
+
 	if err := rejectFreeform("chat", r.ToolCalls); err != nil {
 		return err
 	}
@@ -367,16 +390,16 @@ func EncodeChatStream(enc *SSEEncoder, r ChatResponse) error {
 				},
 			}},
 		}
-		if err := write(head(delta, nil)); err != nil {
+		if err := write(newChatChunk(r, delta, nil)); err != nil {
 			return err
 		}
 	}
 
-	if err := write(head(map[string]any{}, string(r.FinishReason))); err != nil {
+	if err := write(newChatChunk(r, map[string]any{}, string(r.FinishReason))); err != nil {
 		return err
 	}
 	if r.Usage != nil {
-		final := head(map[string]any{}, string(r.FinishReason))
+		final := newChatChunk(r, map[string]any{}, string(r.FinishReason))
 		final["usage"] = r.Usage
 		final["choices"] = []any{}
 		if err := write(final); err != nil {
@@ -384,4 +407,20 @@ func EncodeChatStream(enc *SSEEncoder, r ChatResponse) error {
 		}
 	}
 	return enc.Write(Event{Data: []byte(StreamDoneMarker)})
+}
+
+// newChatChunk 构造一个带公共头的 chunk。头字段（id/object/created/model）
+// 在同一条流里必须恒定。
+func newChatChunk(r ChatResponse, delta map[string]any, finish any) map[string]any {
+	return map[string]any{
+		"id":      r.ID,
+		"object":  "chat.completion.chunk",
+		"created": r.Created,
+		"model":   r.Model,
+		"choices": []any{map[string]any{
+			"index":         0,
+			"delta":         delta,
+			"finish_reason": finish,
+		}},
+	}
 }

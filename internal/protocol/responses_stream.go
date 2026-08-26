@@ -499,55 +499,113 @@ func EncodeResponsesStream(enc *SSEEncoder, r ResponsesResponse) error {
 	if err := r.Validate(); err != nil {
 		return err
 	}
+	if err := responsesWriter(enc)(EventResponseCreated, map[string]any{
+		"type": EventResponseCreated, "response": responsesEnvelope(r, ResponseInProgress, []any{}),
+	}); err != nil {
+		return err
+	}
+	return encodeResponsesTail(enc, r, false)
+}
 
-	write := func(evType string, v any) error {
+// EncodeResponsesBegin 渲染真流式的起始事件：response.created +
+// message item 的 output_item.added。
+//
+// 独立出来是因为真流式下它在第一个文本增量之前发出。传入的 r 只需要
+// ID / Model / CreatedAt / MessageItemID——status 一律按 in_progress 发。
+// 与完整渲染的差别：这里无条件开 message item，因为真流式一定有文本要发
+// （没有文本的话调用方不会走流式路径）。
+func EncodeResponsesBegin(enc *SSEEncoder, r ResponsesResponse) error {
+	write := responsesWriter(enc)
+	if err := write(EventResponseCreated, map[string]any{
+		"type": EventResponseCreated, "response": responsesEnvelope(r, ResponseInProgress, []any{}),
+	}); err != nil {
+		return err
+	}
+	// message item 先开口：后续的 output_text.delta 靠 item_id 关联到它。
+	return write(EventOutputItemAdded, map[string]any{
+		"type": EventOutputItemAdded, "output_index": 0,
+		"item": map[string]any{
+			"id": r.MessageItemID, "type": "message", "role": "assistant",
+			"status": "in_progress", "content": []any{},
+		},
+	})
+}
+
+// EncodeResponsesStreamTail 渲染真流式的收尾段。skipBegin 为真时跳过
+// response.created 与 message item 的 added（已在 Begin 发过），只补
+// message item 的 done、工具调用 item、以及终止事件。
+func EncodeResponsesStreamTail(enc *SSEEncoder, r ResponsesResponse, skipBegin bool) error {
+	if err := r.Validate(); err != nil {
+		return err
+	}
+	if !skipBegin {
+		return EncodeResponsesStream(enc, r)
+	}
+	return encodeResponsesTail(enc, r, true)
+}
+
+// responsesWriter 返回一个写事件的闭包。
+func responsesWriter(enc *SSEEncoder) func(string, any) error {
+	return func(evType string, v any) error {
 		b, err := json.Marshal(v)
 		if err != nil {
 			return fmt.Errorf("protocol: 编码 %s 事件失败：%w", evType, err)
 		}
 		return enc.Write(Event{Type: evType, Data: b})
 	}
+}
 
-	envelope := func(status ResponseStatus, output []any) map[string]any {
-		m := map[string]any{
-			"id":         r.ID,
-			"object":     "response",
-			"created_at": r.CreatedAt,
-			"status":     string(status),
-			"model":      r.Model,
-			"output":     output,
-		}
-		if r.Usage != nil && status.Terminal() {
-			m["usage"] = r.Usage
-		}
-		if r.IncompleteReason != "" && status == ResponseIncomplete {
-			m["incomplete_details"] = map[string]string{"reason": r.IncompleteReason}
-		}
-		return m
+// responsesEnvelope 构造 response 信封。
+func responsesEnvelope(r ResponsesResponse, status ResponseStatus, output []any) map[string]any {
+	m := map[string]any{
+		"id":         r.ID,
+		"object":     "response",
+		"created_at": r.CreatedAt,
+		"status":     string(status),
+		"model":      r.Model,
+		"output":     output,
 	}
+	if r.Usage != nil && status.Terminal() {
+		m["usage"] = r.Usage
+	}
+	if r.IncompleteReason != "" && status == ResponseIncomplete {
+		m["incomplete_details"] = map[string]string{"reason": r.IncompleteReason}
+	}
+	return m
+}
 
-	if err := write(EventResponseCreated, map[string]any{
-		"type": EventResponseCreated, "response": envelope(ResponseInProgress, []any{}),
-	}); err != nil {
-		return err
+// encodeResponsesTail 渲染 message item 与工具调用 item，再发终止事件。
+// beganMessage 为真表示 message item 的 added 已经发过（真流式路径）。
+func encodeResponsesTail(enc *SSEEncoder, r ResponsesResponse, beganMessage bool) error {
+	write := responsesWriter(enc)
+	envelope := func(status ResponseStatus, output []any) map[string]any {
+		return responsesEnvelope(r, status, output)
 	}
 
 	index := 0
 	var finalOutput []any
 
-	if len(r.Content) > 0 && string(r.Content) != "null" {
+	hasContent := len(r.Content) > 0 && string(r.Content) != "null"
+	if hasContent || beganMessage {
 		item := map[string]any{
 			"id": r.MessageItemID, "type": "message", "role": "assistant",
 			"status": "completed", "content": r.Content,
 		}
-		if err := write(EventOutputItemAdded, map[string]any{
-			"type": EventOutputItemAdded, "output_index": index,
-			"item": map[string]any{
-				"id": r.MessageItemID, "type": "message", "role": "assistant",
-				"status": "in_progress", "content": []any{},
-			},
-		}); err != nil {
-			return err
+		if item["content"] == nil || !hasContent {
+			// 真流式下上游只发过增量、Result.Text 为空的极端情形：
+			// 仍要给 message item 收口，内容用空数组。
+			item["content"] = []any{}
+		}
+		if !beganMessage {
+			if err := write(EventOutputItemAdded, map[string]any{
+				"type": EventOutputItemAdded, "output_index": index,
+				"item": map[string]any{
+					"id": r.MessageItemID, "type": "message", "role": "assistant",
+					"status": "in_progress", "content": []any{},
+				},
+			}); err != nil {
+				return err
+			}
 		}
 		if err := write(EventOutputItemDone, map[string]any{
 			"type": EventOutputItemDone, "output_index": index, "item": item,

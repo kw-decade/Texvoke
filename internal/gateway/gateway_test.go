@@ -640,6 +640,140 @@ func TestGatewayHandleSSEHeartbeatDisabled(t *testing.T) {
 	}
 }
 
+// streamingAdapter 实现 upstream.StreamWriter：按片吐字，每片之间留间隔，
+// 并把每片交付的时刻记下来——用于证明「边收边发」而不是攒完再发。
+type streamingAdapter struct {
+	chunks []string
+	gap    time.Duration
+	calls  atomic.Int32
+}
+
+func (s *streamingAdapter) Name() string { return "streaming" }
+
+func (s *streamingAdapter) Models(context.Context) ([]string, error) {
+	return []string{"mock-model"}, nil
+}
+
+func (s *streamingAdapter) Complete(ctx context.Context, model string, msgs []protocol.Message) (upstream.Reply, error) {
+	return s.CompleteStream(ctx, model, msgs, nil)
+}
+
+func (s *streamingAdapter) CompleteStream(ctx context.Context, _ string, msgs []protocol.Message,
+	onChunk upstream.StreamHandler) (upstream.Reply, error) {
+
+	s.calls.Add(1)
+	// 有信号时按脚本回 envelope（与 signalAdapter 同款），否则吐 chunks。
+	parts := s.chunks
+	if sig := extractSignal(msgs); sig != "" && len(parts) == 0 {
+		parts = []string{sig + "\n", `<tool_call_envelope version="1"><call id="c1"><tool>write_file</tool>`,
+			`<arguments_json>{"path":"/tmp/hello.txt"}</arguments_json></call></tool_call_envelope>`}
+	}
+	var full strings.Builder
+	for _, p := range parts {
+		select {
+		case <-ctx.Done():
+			return upstream.Reply{Text: full.String()}, ctx.Err()
+		case <-time.After(s.gap):
+		}
+		full.WriteString(p)
+		if onChunk != nil {
+			if err := onChunk([]byte(p)); err != nil {
+				return upstream.Reply{Text: full.String()}, err
+			}
+		}
+	}
+	return upstream.Reply{Text: full.String(), Status: 200}, nil
+}
+
+// TestGatewayRealStreamingDeliversIncrementally 钉住真流式的核心承诺：
+// 文本在上游说完之前就已经到客户端。
+//
+// 判据不用时间戳（脆弱），用「上游还没吐完时缓冲里已经有数据事件」——
+// 在最后一片到达前检查一次写入器，有内容就说明没有攒着。
+func TestGatewayRealStreamingDeliversIncrementally(t *testing.T) {
+	ad := &streamingAdapter{
+		chunks: []string{"第一段。", "第二段。", "第三段。"},
+		gap:    20 * time.Millisecond,
+	}
+	g, err := New(Config{
+		Bridge: bridge(t), Adapter: ad,
+		HeartbeatInterval: -1, // 关掉心跳，缓冲里只留真实事件
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// probeWriter 在第二次写入时抓一份快照：那时上游还没吐完。
+	pw := &probeWriter{snapshotAt: 2}
+	if err := g.HandleSSE(context.Background(), "chat", chatBody(t, false), pw); err != nil {
+		t.Fatalf("HandleSSE 失败：%v", err)
+	}
+
+	if pw.snapshot == "" {
+		t.Fatal("上游吐完之前客户端一个字节都没收到——还是伪流式")
+	}
+	if !strings.Contains(pw.snapshot, "第一段") {
+		t.Errorf("早期快照里没有第一段文本：%q", pw.snapshot)
+	}
+	out := pw.all.String()
+	for _, frag := range []string{"第一段", "第二段", "第三段"} {
+		if !strings.Contains(out, frag) {
+			t.Errorf("增量 %q 丢了：%s", frag, out)
+		}
+	}
+	if !strings.Contains(out, "data: [DONE]") {
+		t.Fatalf("终止事件缺失，客户端会挂住：%s", out)
+	}
+	// 正文不能重发：每段各自恰好一次。
+	for _, frag := range []string{"第一段", "第二段", "第三段"} {
+		if n := strings.Count(out, frag); n != 1 {
+			t.Errorf("%q 出现 %d 次，应恰好一次：%s", frag, n, out)
+		}
+	}
+}
+
+// TestGatewayRealStreamingHidesEnvelope 钉住提交边界：envelope 的任何片段
+// 都不得漏给客户端，工具调用只以协议原生形态出现。
+func TestGatewayRealStreamingHidesEnvelope(t *testing.T) {
+	// 先叙述、再发信号与 envelope——真实模型最常见的形态。
+	ad := &streamingAdapter{gap: 5 * time.Millisecond}
+	g := gw(t, ad)
+
+	var buf bytes.Buffer
+	if err := g.HandleSSE(context.Background(), "chat", bodyFor(t, "chat", true), &buf); err != nil {
+		t.Fatalf("HandleSSE 失败：%v", err)
+	}
+	out := buf.String()
+	for _, leak := range []string{"UTR-CALL", "tool_call_envelope", "arguments_json"} {
+		if strings.Contains(out, leak) {
+			t.Errorf("协议内容泄漏给客户端（%q）：%s", leak, out)
+		}
+	}
+	if !strings.Contains(out, `"tool_calls"`) || !strings.Contains(out, "write_file") {
+		t.Errorf("调用没有以原生形态渲染出来：%s", out)
+	}
+	if !strings.Contains(out, "data: [DONE]") {
+		t.Errorf("终止事件缺失：%s", out)
+	}
+}
+
+// probeWriter 记录全部写入，并在第 n 次写入时留一份快照。
+type probeWriter struct {
+	all        strings.Builder
+	writes     int
+	snapshotAt int
+	snapshot   string
+}
+
+func (p *probeWriter) Write(b []byte) (int, error) {
+	p.writes++
+	p.all.Write(b)
+	if p.writes == p.snapshotAt {
+		p.snapshot = p.all.String()
+	}
+	return len(b), nil
+}
+
 // bodyFor 按协议构造带工具的最小请求体。三协议的工具声明形状不同
 // （Chat 包一层 function、Anthropic 用 input_schema、Responses 平铺），
 // 工具名统一 write_file，signalAdapter 才认得。

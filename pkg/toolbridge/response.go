@@ -49,18 +49,20 @@ func (s *Session) RenderResponse(req *Request, res *Result, opts RenderOptions) 
 
 // StreamRenderer 按客户端协议输出 SSE 事件。
 //
-// **当前是伪流式**：WriteText 收下的增量会攒起来，直到 Finish 才一次性
-// 渲染成完整的事件序列。客户端看到的事件形状完全正确（该有的
-// message_start / content_block_delta / [DONE] 一个不少），但没有逐 token
-// 的时间分布——第一个字要等模型说完才到。
+// **真流式**：WriteText 收到的每个增量立刻编成客户端协议的事件写出并
+// Flush。首个增量触发各协议的起始事件（Chat 的 role 首包、Anthropic 的
+// message_start + content_block_start、Responses 的 response.created +
+// output_item.added），Finish 负责工具调用与终止事件——终止事件一个不能少
+// （不变量 16）：Chat 的 [DONE]、Anthropic 的 content_block_stop +
+// message_stop、Responses 的 output_item.done + response.completed。
 //
-// 为什么先这样：三协议的增量事件序列各有各的状态机（Anthropic 要
-// content_block_start/stop 配对，Responses 要 output_item 与 content_part
-// 两层嵌套），手写容易与 internal/protocol 的整体渲染分叉。正确的做法是
-// 给 protocol 加增量编码器，让两条路径共用同一份序列知识。
+// 文本与调用的分工来自协议本身的形状：模型被教成「先输出信号再写
+// envelope」，所以调用（如果有）永远出现在文本之后、输出末尾；且调用参数
+// 必须完整到达才能发。于是文本属于流式阶段，调用属于收尾阶段。
 //
-// API 形状已经是流式的，所以那次升级不会影响你的调用代码——
-// WriteText 会从「攒着」变成「立刻发出」，其余不变。
+// 一致性约束（不变量 8）：Finish 收到的 Result.Text 必须与已发增量的拼接
+// 一致。调用方（gateway）的权威来源是同一个 StreamParser，天然满足；
+// Finish 里对已发过的文本不再重复渲染，只补 tool_calls 与收尾。
 //
 // 配合 StreamParser 使用——后者负责判断哪些字节确定不是协议信号、
 // 可以安全发出去，这里负责把它们编成客户端认识的事件。
@@ -84,7 +86,12 @@ type StreamRenderer struct {
 	w    io.Writer
 
 	finished bool
-	text     []byte
+
+	// streamed 记录是否已发出过增量（决定 Finish 走哪条路径）。
+	streamed bool
+	// text 累计已发出的内容：Finish 时的对账依据，也是未发过任何增量时
+	// 一次性渲染的数据源（回落伪流式，行为与历史版本一致）。
+	text []byte
 }
 
 // NewStreamRenderer 创建流式渲染器。
@@ -98,27 +105,106 @@ func (s *Session) NewStreamRenderer(req *Request, w io.Writer, opts RenderOption
 	return &StreamRenderer{sess: s, req: req, opts: opts, enc: protocol.NewSSEEncoder(w), w: w}, nil
 }
 
-// WriteText 收下一段文本增量。空输入是空操作。
+// WriteText 收下一段文本增量并立即发给客户端。
 //
-// ponytail: 当前只累积不发送，Finish 时一次性渲染（见类型文档）。
-// 升级到真增量时改这里，调用方不用动。
+// 第一个非空增量先触发协议起始事件。返回错误时流已损坏（写失败说明客户端
+// 断开），后续 Write 与 Finish 仍可调用但不会再写字节。
 func (sr *StreamRenderer) WriteText(b []byte) error {
 	if len(b) == 0 || sr.finished {
 		return nil
 	}
+	if !sr.streamed {
+		if err := sr.begin(); err != nil {
+			return err
+		}
+		sr.streamed = true
+	}
 	sr.text = append(sr.text, b...)
-	return nil
+	return sr.delta(string(b))
 }
 
-// Finish 收尾：发出工具调用与结束事件。
+// begin 发出协议起始事件。只在第一个增量前调用一次。
+func (sr *StreamRenderer) begin() error {
+	switch sr.req.Protocol() {
+	case ProtocolChat:
+		// Chat 的首包只带 role——OpenAI 的既定形态，客户端据此知道消息开始。
+		b, err := json.Marshal(map[string]any{
+			"id": sr.respID("chatcmpl_"), "object": "chat.completion.chunk",
+			"created": time.Now().Unix(), "model": sr.modelName(),
+			"choices": []any{map[string]any{
+				"index": 0, "delta": map[string]any{"role": "assistant"},
+				"finish_reason": nil,
+			}},
+		})
+		if err != nil {
+			return err
+		}
+		return sr.enc.Write(protocol.Event{Data: b})
+	case ProtocolResponses:
+		return protocol.EncodeResponsesBegin(sr.enc, protocol.ResponsesResponse{
+			ID: sr.respID("resp_"), Model: sr.modelName(),
+			CreatedAt:     time.Now().Unix(),
+			Status:        protocol.ResponseInProgress,
+			MessageItemID: sr.itemID(),
+		})
+	default:
+		startUsage := &protocol.AnthropicUsage{}
+		return protocol.EncodeAnthropicMessageStart(sr.enc, protocol.MessagesResponse{
+			ID: sr.respID("msg_"), Model: sr.modelName(),
+		}, startUsage)
+	}
+}
+
+// delta 发出一段文本增量事件。
+func (sr *StreamRenderer) delta(text string) error {
+	switch sr.req.Protocol() {
+	case ProtocolChat:
+		return protocol.EncodeChatTextDelta(sr.enc, sr.respID("chatcmpl_"), sr.modelName(), time.Now().Unix(), text)
+	case ProtocolResponses:
+		return protocol.EncodeResponsesTextDelta(sr.enc, sr.itemID(), text)
+	default:
+		return protocol.EncodeAnthropicTextDelta(sr.enc, 0, text)
+	}
+}
+
+// respID 返回响应标识（opts.ID 优先）。同一渲染器内多次取值必须一致，
+// 所以第一次调用时生成后存进 opts.ID。
+func (sr *StreamRenderer) respID(prefix string) string {
+	if sr.opts.ID == "" {
+		sr.opts.ID = prefix + randomID()
+	}
+	return sr.opts.ID
+}
+
+// modelName 返回响应里回报的模型名。
+func (sr *StreamRenderer) modelName() string { return modelOr(sr.opts.Model, sr.req) }
+
+// itemID 返回 Responses 协议的 message item 标识。
+//
+// 用会话 nonce 算摘要而不是随机数：增量事件的 item_id 与收尾 output_item.done
+// 里的 id 必须逐字相同，客户端才能把文本拼回同一个 item（不变量 5 的同类
+// 要求）。同一轮内多次取值稳定，跨轮 nonce 不同则必然不同。
+func (sr *StreamRenderer) itemID() string {
+	return "msg_" + observability.Digest(sr.sess.nonce.Value())[:24]
+}
+
+// Finish 收尾：发出工具调用与终止事件。
 //
 // 必须调用，否则客户端会一直等——Chat 等 [DONE]，Anthropic 等
-// message_stop，Responses 等 response.completed。
+// message_stop，Responses 等 response.completed（不变量 16）。
+//
+// 已流式发出过文本时：文本部分跳过重发（增量已实时到达），只补 tool_calls
+// 与各协议的终止事件。未流式过（上游全程 envelope 或零输出）时：一次性
+// 渲染完整序列，行为与历史版本一致。
 func (sr *StreamRenderer) Finish(res Result) error {
 	if sr.finished {
 		return nil
 	}
 	sr.finished = true
+
+	if sr.streamed {
+		return sr.finishStreamed(res)
+	}
 
 	merged := res
 	if merged.Text == "" {
@@ -131,6 +217,31 @@ func (sr *StreamRenderer) Finish(res Result) error {
 		return protocol.EncodeResponsesStream(sr.enc, responsesResponse(sr.sess, sr.req, &merged, sr.opts))
 	default:
 		return protocol.EncodeAnthropicStream(sr.enc, messagesResponse(sr.sess, sr.req, &merged, sr.opts))
+	}
+}
+
+// finishStreamed 补齐真流式的收尾：tool_calls 事件 + 终止事件。
+//
+// 文本不再重发。三协议的收尾形状各自不同：
+//   - Chat：每个调用一个 tool_calls delta chunk → finish_reason chunk →
+//     usage 尾包 → [DONE]。复用 EncodeChatStream 会重发文本，所以这里
+//     手工补齐——但事件形状必须与它逐一对齐。
+//   - Anthropic：content_block_stop → 每个调用的 content_block_start/delta/
+//     stop（tool_use 块）→ message_delta(stop_reason) → message_stop。
+//   - Responses：output_item.done（message item 收口）→ 每个调用的
+//     function_call item → response.completed（output 数组含全部 item）。
+func (sr *StreamRenderer) finishStreamed(res Result) error {
+	proto := sr.req.Protocol()
+	switch proto {
+	case ProtocolChat:
+		return protocol.EncodeChatStreamTail(sr.enc, chatResponse(sr.sess, sr.req, &res, sr.opts), true)
+	case ProtocolResponses:
+		resp := responsesResponse(sr.sess, sr.req, &res, sr.opts)
+		// item_id 必须与已发增量里的完全一致，否则客户端拼不回同一个 item。
+		resp.MessageItemID = sr.itemID()
+		return protocol.EncodeResponsesStreamTail(sr.enc, resp, true)
+	default:
+		return protocol.EncodeAnthropicStreamTail(sr.enc, messagesResponse(sr.sess, sr.req, &res, sr.opts), true)
 	}
 }
 
