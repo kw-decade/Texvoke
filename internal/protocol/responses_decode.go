@@ -4,9 +4,20 @@ import (
 	"encoding/json"
 	"fmt"
 	"slices"
+	"strings"
 
 	"github.com/kw-decade/Texvoke/internal/ir"
 )
+
+// ReasoningSummaryMarker 是回灌历史时给推理摘要加的前缀。
+//
+// 作用只有一个：让摘要与模型的公开发言可区分。没有它，上一轮的内心独白
+// 会以第一人称混进 assistant 正文，读起来像模型当时对用户说过的话。
+//
+// 措辞纪律（见 CLAUDE.md）：这行字会进 Prompt，属于需要 utr-eval 前后对比
+// 的改动。当前实测链路不通，取的是最直白的描述性写法、不含任何指令语气。
+// 链路恢复后补一组对比。
+const ReasoningSummaryMarker = "[reasoning summary]"
 
 var responsesKnownFields = map[string]bool{
 	"model":                true,
@@ -537,22 +548,59 @@ func decodeResponsesInput(raw, instructions json.RawMessage, opts DecodeOptions)
 			})
 
 		case "reasoning":
-			// 推理 item 携带模型的隐藏思维摘要与加密载荷。跳过它，并记一笔。
+			// 推理 item 装着两样性质完全不同的东西：
 			//
-			// 一开始这里是拒绝整个请求，理由是「不做静默降级以免改写模型的
-			// 隐藏推理内容」。扫了 528 个真实 Codex 会话之后改掉了：
-			// reasoning 是出现次数最高的 item 类型（比 message 还多），
-			// 拒绝它等于宣布这个中间件只能跑第一轮。
+			//	summary[].text     模型公开写出的推理摘要（Codex 界面上那段
+			//	                   Thinking 就是它，用户已经看到了）
+			//	encrypted_content  真正的隐藏载荷，只有原上游能解开
 			//
-			// 跳过在这里不是「改写」，是承认表达不了：本项目的上游是纯文本
-			// 模型，它既不产生 reasoning，转成 Chat 协议后也没有地方放。
-			// 历史里出现的 reasoning 必然来自另一个上游，对当前这个没有意义。
+			// 一开始整个 item 都跳过，理由是「把 summary 变成正文等于替模型
+			// 改写它没说出口的话」。这个理由对 encrypted_content 成立，对
+			// summary 不成立——它本来就是给人看的。
 			//
-			// 不做的事：不把 summary 转成正文。那才是真正的改写——
-			// 把模型没说出口的东西变成它公开说过的话。
+			// 而丢掉它的代价是具体的：多轮会话里「上一轮模型打算怎么做」
+			// 整段消失，纯文本上游只看到一串函数调用结果，看不到那些调用
+			// 是为了什么。扫过的 528 个真实 Codex 会话里 reasoning 是出现
+			// 次数最高的 item 类型，丢的不是边角料。
+			//
+			// 现在的处置：summary 带标记并入 assistant 内容（标记让它与模型
+			// 的公开发言可区分，不冒充后者），encrypted_content 仍然跳过，
+			// skippedItems 照记 "reasoning"——这个 item 类型确实没有被完整
+			// 表达，观测语义不变。
+			var rz struct {
+				Summary []struct {
+					Text string `json:"text"`
+				} `json:"summary"`
+			}
+			if err := json.Unmarshal(raw, &rz); err != nil {
+				return res, fmt.Errorf("protocol: 第 %d 个 reasoning item 格式非法：%w", i, err)
+			}
 			if !slices.Contains(res.skippedItems, "reasoning") {
 				res.skippedItems = append(res.skippedItems, "reasoning")
 			}
+			var parts []string
+			for _, s := range rz.Summary {
+				if t := strings.TrimSpace(s.Text); t != "" {
+					parts = append(parts, t)
+				}
+			}
+			if len(parts) == 0 {
+				// 只有 encrypted_content 的 item：没有任何可表达的内容。
+				continue
+			}
+			marked, err := json.Marshal(ReasoningSummaryMarker + "\n" + strings.Join(parts, "\n\n"))
+			if err != nil {
+				return res, fmt.Errorf("protocol: 第 %d 个 reasoning item 的 summary 编码失败：%w", i, err)
+			}
+			// 后续的 function_call 会认领同一条 pending assistant 消息，于是
+			// 「想了什么 + 因此调了什么」留在一条消息里，顺序不会被打散。
+			if pending == nil || pending.Role != RoleAssistant || pending.hasContent() {
+				if err := flush(); err != nil {
+					return res, fmt.Errorf("protocol: 第 %d 个 item 之前的内容非法：%w", i, err)
+				}
+				pending = &Message{Role: RoleAssistant}
+			}
+			pending.Content = marked
 
 		case "":
 			return res, fmt.Errorf("protocol: 第 %d 个 input item 既没有 type 也没有 role", i)
@@ -563,8 +611,8 @@ func decodeResponsesInput(raw, instructions json.RawMessage, opts DecodeOptions)
 			// 客户端会带自己的扩展 item。为一个我们不认识的扩展把整轮对话
 			// 挡在门外，代价远大于收益。
 			//
-			// reasoning 是唯一的例外，在上面单独拒绝——它携带模型的隐藏
-			// 推理内容，静默丢弃等于替模型改写它没说出口的东西。
+			// reasoning 在上面单独处理：它的 summary 有可表达的内容，
+			// 不能与「完全不认识」的 item 混为一谈。
 			if !slices.Contains(res.skippedItems, kind) {
 				res.skippedItems = append(res.skippedItems, kind)
 			}

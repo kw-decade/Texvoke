@@ -142,12 +142,20 @@ func TestSkippedItemTypesAreDeduped(t *testing.T) {
 	}
 }
 
-// reasoning 跳过，但必须留下痕迹。
+// reasoning 的 summary 保留、encrypted_content 丢弃，两者分开处置。
 //
-// 一开始这里是拒绝整个请求。扫了 528 个真实 Codex 会话后改掉了：
-// reasoning 是出现次数最高的 item 类型（1787 次，比 message 还多），
-// 拒绝它等于宣布这个中间件只能跑第一轮。
-func TestReasoningItemIsSkippedButVisible(t *testing.T) {
+// 这条断言反过来改过一次，两次都有理由，记下来免得再翻烧饼：
+//   - 最早拒绝整个请求。扫了 528 个真实 Codex 会话后改掉——reasoning 是
+//     出现次数最高的 item 类型（1787 次，比 message 还多），拒绝它等于宣布
+//     这个中间件只能跑第一轮。
+//   - 然后是整个 item 跳过，理由「把 summary 变成正文等于替模型改写它没说
+//     出口的话」。这个理由对 encrypted_content 成立，对 summary 不成立：
+//     summary 是模型公开写给人看的，客户端已经显示在屏幕上了。丢掉它，
+//     多轮会话里「上一轮打算怎么做」整段消失。
+//
+// 所以现在：summary 带标记回灌（标记保证它不冒充公开发言），
+// encrypted_content 仍然不出现在任何编码结果里。
+func TestReasoningSummaryIsPreservedEncryptedIsNot(t *testing.T) {
 	req, err := DecodeResponsesRequest([]byte(`{
 		"model": "gpt-4o",
 		"input": [
@@ -159,21 +167,82 @@ func TestReasoningItemIsSkippedButVisible(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reasoning item 不该让整轮对话失败：%v", err)
 	}
-	if len(req.Input) != 1 || req.Input[0].Role != RoleUser {
-		t.Fatalf("应只剩那条 user 消息：%+v", req.Input)
+	if len(req.Input) != 2 {
+		t.Fatalf("应有摘要消息 + user 消息两条：%+v", req.Input)
 	}
-	// 跳过必须可见。
+	if req.Input[0].Role != RoleAssistant {
+		t.Fatalf("摘要应挂在 assistant 名下，得到 %q", req.Input[0].Role)
+	}
+	if got := req.Input[0].Text(); !strings.Contains(got, "我在想") {
+		t.Errorf("摘要内容丢了：%q", got)
+	}
+	if got := req.Input[0].Text(); !strings.HasPrefix(got, ReasoningSummaryMarker) {
+		t.Errorf("摘要缺少标记，会被当成模型的公开发言：%q", got)
+	}
+	// 这个 item 类型没有被完整表达，观测语义不变。
 	if len(req.SkippedItemTypes) != 1 || req.SkippedItemTypes[0] != "reasoning" {
-		t.Errorf("跳过的 reasoning 没记下来：%v", req.SkippedItemTypes)
+		t.Errorf("reasoning 的跳过记录不该消失：%v", req.SkippedItemTypes)
 	}
-	// 但绝不能把 summary 变成正文——那是真正的改写，
-	// 把模型没说出口的东西变成它公开说过的话。
 	encoded, err := EncodeResponsesRequest(*req)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(encoded), "我在想") {
-		t.Errorf("隐藏推理内容被转成了正文：%s", encoded)
+	if strings.Contains(string(encoded), "xxx") {
+		t.Errorf("加密载荷被带出去了：%s", encoded)
+	}
+}
+
+// 只有 encrypted_content 的 reasoning item 没有可表达的内容：整条跳过，
+// 不产出一条只剩标记的空消息。
+func TestReasoningWithoutSummaryAddsNothing(t *testing.T) {
+	req, err := DecodeResponsesRequest([]byte(`{
+		"model": "gpt-4o",
+		"input": [
+			{"type": "reasoning", "id": "rs_1", "encrypted_content": "xxx"},
+			{"type": "message", "role": "user", "content": "你好"}
+		]
+	}`), testOpts)
+	if err != nil {
+		t.Fatalf("不该失败：%v", err)
+	}
+	if len(req.Input) != 1 || req.Input[0].Role != RoleUser {
+		t.Fatalf("应只剩那条 user 消息：%+v", req.Input)
+	}
+	if len(req.SkippedItemTypes) != 1 || req.SkippedItemTypes[0] != "reasoning" {
+		t.Errorf("跳过的 reasoning 没记下来：%v", req.SkippedItemTypes)
+	}
+}
+
+// 摘要与紧随其后的 function_call 必须落在同一条 assistant 消息里。
+//
+// 分成两条会产生连续两个 assistant 消息，也会把「想了什么」和「因此调了
+// 什么」在时间线上拆开——回灌历史的全部价值就是这个因果关系。
+func TestReasoningSummaryMergesWithFollowingCall(t *testing.T) {
+	req, err := DecodeResponsesRequest([]byte(`{
+		"model": "gpt-4o",
+		"input": [
+			{"type": "message", "role": "user", "content": "看一下配置"},
+			{"type": "reasoning", "id": "rs_1", "summary": [{"type":"summary_text","text":"先读文件"}]},
+			{"type": "function_call", "id": "fc_1", "call_id": "call_1",
+			 "name": "read_file", "arguments": "{\"path\":\"/etc/hosts\"}"},
+			{"type": "function_call_output", "call_id": "call_1", "output": "127.0.0.1"}
+		]
+	}`), testOpts)
+	if err != nil {
+		t.Fatalf("不该失败：%v", err)
+	}
+	if len(req.Input) != 3 {
+		t.Fatalf("应是 user / assistant(摘要+调用) / tool 三条：%+v", req.Input)
+	}
+	a := req.Input[1]
+	if a.Role != RoleAssistant {
+		t.Fatalf("第二条应是 assistant，得到 %q", a.Role)
+	}
+	if !strings.Contains(a.Text(), "先读文件") {
+		t.Errorf("摘要没并进来：%q", a.Text())
+	}
+	if len(a.ToolCalls) != 1 {
+		t.Fatalf("调用被拆到别的消息里了：%+v", a)
 	}
 }
 
