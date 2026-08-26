@@ -62,6 +62,7 @@ func main() {
 		n       = flag.Int("n", 6, "每份 fixture 跑几次")
 		only    = flag.String("only", "", "只跑名字含这个子串的 fixture")
 		timeout = flag.Duration("timeout", 3*time.Minute, "单次请求超时")
+		model   = flag.String("model", "", "覆盖 fixture 里的模型名（抓包的名字未必是当前上游有的）")
 		verbose = flag.Bool("v", false, "打印每一次的模型输出摘要")
 	)
 	flag.Parse()
@@ -76,6 +77,7 @@ func main() {
 		base:    strings.TrimRight(*base, "/"),
 		dir:     *dir,
 		times:   *n,
+		model:   *model,
 		verbose: *verbose,
 		client:  &http.Client{Timeout: *timeout},
 	}
@@ -148,6 +150,7 @@ type runner struct {
 	base    string
 	dir     string
 	times   int
+	model   string
 	verbose bool
 	client  *http.Client
 }
@@ -176,6 +179,10 @@ func (r *runner) run(f fixture) (report, error) {
 	// fixture 里可能带 stream:true（真实抓包就是），评测统一走非流式：
 	// 我们要的是最终结构，而流式只是同一个结果的另一种传输方式。
 	body, err = forceNonStream(body)
+	if err != nil {
+		return report{}, err
+	}
+	body, err = overrideModel(body, r.model)
 	if err != nil {
 		return report{}, err
 	}
@@ -210,15 +217,9 @@ func (r *runner) run(f fixture) (report, error) {
 			ModelText:             out.text,
 		})
 
-		kind := string(cls.Kind)
-		if cls.Kind == capability.RefusalNone {
-			kind = "calls_parsed"
-			if len(out.calls) == 0 {
-				// 没有调用也不算拒绝：tool_choice=auto 时模型正常回答是合法的。
-				kind = "plain_text_ok"
-			} else if f.ExpectTool != "" && !hasTool(out.calls, f.ExpectTool) {
-				rep.wrongTool++
-			}
+		kind, wrong := classifyRun(cls.Kind, out, f.ExpectTool)
+		if wrong {
+			rep.wrongTool++
 		}
 		rep.byKind[kind]++
 		rep.keepSample(kind, out.text)
@@ -229,6 +230,31 @@ func (r *runner) run(f fixture) (report, error) {
 	}
 	rep.elapsed = time.Since(start)
 	return rep, nil
+}
+
+// classifyRun 把「拒绝分类 + 这一轮的实际产出」归成报表里的一个格子。
+//
+// 单独成函数是因为它是整个工具唯一的判断题，而它一旦判错，报表就会用一个
+// 好看的数字盖住真实故障——2026-08-26 就被瞒过一次：上游回
+// 400 model does not exist，网关按不变量 16 降级成 200 + 空 plain_text，
+// 报表显示 100% plain_text_ok。零调用 + 零文本不是「模型正常回答」，
+// 是这一轮什么都没发生，必须自成一类。
+//
+// 返回第二个值表示「调用了工具但不是期望的那个」——它不算协议层失败
+// （协议层的活干完了），只是任务语义层的旁注。
+func classifyRun(kind capability.RefusalKind, out outcome, expectTool string) (string, bool) {
+	if kind != capability.RefusalNone {
+		return string(kind), false
+	}
+	switch {
+	case len(out.calls) > 0:
+		return "calls_parsed", expectTool != "" && !hasTool(out.calls, expectTool)
+	case strings.TrimSpace(out.text) != "":
+		// tool_choice=auto 时模型选择正常回答是合法的。
+		return "plain_text_ok", false
+	default:
+		return "empty_response", false
+	}
 }
 
 func (r *report) keepSample(kind, text string) {
@@ -394,6 +420,28 @@ func forceNonStream(body []byte) ([]byte, error) {
 		return nil, fmt.Errorf("fixture 不是合法 JSON 对象：%w", err)
 	}
 	top["stream"] = json.RawMessage("false")
+	return json.Marshal(top)
+}
+
+// overrideModel 换掉 fixture 里的模型名。
+//
+// 为什么需要：fixture 是真实抓包，模型名是当时那个客户端连的那个上游的名字
+// （`claude-sonnet-4` 之类）。换一个上游测就必然对不上，而上游对不认识的
+// 模型名回 400——那不是协议可靠性的信号，却会把整份 fixture 的数字带偏。
+// 不改 fixture 本身：抓包的价值就在于它是原样的。
+func overrideModel(body []byte, model string) ([]byte, error) {
+	if model == "" {
+		return body, nil
+	}
+	var top map[string]json.RawMessage
+	if err := json.Unmarshal(body, &top); err != nil {
+		return nil, fmt.Errorf("fixture 不是合法 JSON 对象：%w", err)
+	}
+	b, err := json.Marshal(model)
+	if err != nil {
+		return nil, err
+	}
+	top["model"] = b
 	return json.Marshal(top)
 }
 
