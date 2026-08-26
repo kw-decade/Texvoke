@@ -54,6 +54,18 @@ const maxUpstreamRetries = 3
 // 预算耗尽不是错误：把已经拿到的文本如实渲染回去，与上游挂掉同一处置。
 const defaultRequestBudget = 10 * time.Minute
 
+// defaultHeartbeatInterval 是伪流式等待期的保活间隔。
+//
+// 为什么必须有：HandleSSE 的第一个数据事件要等上游说完，而一轮上游调用加上
+// 阶梯追问可能要几十秒到几分钟。客户端在这段静默里会判定连接已死并断开——
+// 服务端还在正常干活，客户端已经走了，用户看到的是「请求失败」。
+// SSE 注释帧（`: ...` 开头）不携带内容且规范要求所有客户端忽略它，是保持
+// 连接最便宜的方式。15 秒给最激进的 30 秒空闲阈值留了一倍余量。
+const defaultHeartbeatInterval = 15 * time.Second
+
+// keepaliveFrame 是心跳写出的字节。SSE 注释帧，一个字节的语义都没有。
+const keepaliveFrame = ": texvoke keepalive\n\n"
+
 // Config 配置一个网关实例。
 type Config struct {
 	Bridge *toolbridge.Bridge
@@ -74,6 +86,10 @@ type Config struct {
 	// RequestBudget 是单次请求的墙钟总上限，0 用 defaultRequestBudget。
 	// 负值表示不设预算（只受客户端断开约束）——只在调试时用。
 	RequestBudget time.Duration
+
+	// HeartbeatInterval 覆盖流式等待期的保活间隔，0 用
+	// defaultHeartbeatInterval。负值关闭心跳。
+	HeartbeatInterval time.Duration
 
 	Log *slog.Logger
 }
@@ -257,11 +273,14 @@ func (g *Gateway) loop(ctx context.Context, sess *toolbridge.Session, decoded *t
 	for round := 0; round < maxRecoverRounds; round++ {
 		text, uerr := g.completeWithRetry(ctx, decoded.Model(), decoded.Messages())
 		if uerr != nil {
-			// 上游彻底不可用（含永久性错误与预算耗尽）。没有文本可透传时，
-			// 把空文本的 plain_text 结果交出去——错误详情已记日志，客户端
-			// 拿到的是一个诚实的空响应而不是 500。这与前身实现的降级
-			// 原则一致：上游挂了不是杀死请求的理由。
+			// 上游彻底不可用（含永久性错误与预算耗尽）。降级顺序：
+			// 断流前的部分文本 → 上一轮的完整结果 → 空文本的 plain_text。
+			// 半截回答也比让用户等完一整轮重生成强，比空响应更强。
 			g.log.Warn("上游调用最终失败", "round", round, "error", uerr.Error())
+			if strings.TrimSpace(text) != "" {
+				g.log.Info("透传断流前的部分文本", "bytes", len(text))
+				return &toolbridge.Result{Outcome: toolbridge.OutcomePlainText, Text: text}
+			}
 			if last != nil {
 				return last
 			}
@@ -362,15 +381,20 @@ func (g *Gateway) recover(sess *toolbridge.Session, decoded *toolbridge.Request,
 // 重试只针对瞬态故障（连接断、超时、上游内嵌的 country/403 类抖动）；
 // 内容审查等永久性错误第一次就返回。判定复用 capability 的传输层经验：
 // 错误消息匹配瞬态特征才重试，其余直接失败。
+//
+// 返回值约定：错误时 string 尽量非空——上游断流前已经吐出的部分文本
+// 跟着错误一起交回来，调用方拿它降级透传，而不是让用户等完一整轮
+// 重生成再从零开始。
 func (g *Gateway) completeWithRetry(ctx context.Context, model string, messages []protocol.Message) (string, error) {
 	var lastErr error
+	var lastPartial string
 	for attempt := 0; attempt <= maxUpstreamRetries; attempt++ {
 		// 预算耗尽或客户端断开时立刻停手。这一步不能省：http.Client 的超时
 		// 错误文本里带 timeout，会被 isTransient 判成瞬态，于是一个已经没人
 		// 等的请求还要白等三轮。
 		if err := ctx.Err(); err != nil {
 			if lastErr != nil {
-				return "", lastErr
+				return lastPartial, lastErr
 			}
 			return "", err
 		}
@@ -383,15 +407,20 @@ func (g *Gateway) completeWithRetry(ctx context.Context, model string, messages 
 			lastErr = errors.New("上游返回空响应")
 		} else {
 			lastErr = err
+			// 断流前已收到的部分文本记下来。重试成功就用完整的，
+			// 全部失败时把它交出去——半截回答好过一无所有。
+			if strings.TrimSpace(reply.Text) != "" {
+				lastPartial = reply.Text
+			}
 			if !isTransient(err) {
-				return "", err
+				return reply.Text, err
 			}
 		}
 		if attempt < maxUpstreamRetries {
 			g.log.Warn("上游瞬态故障，重试", "attempt", attempt+1, "error", lastErr.Error())
 		}
 	}
-	return "", lastErr
+	return lastPartial, lastErr
 }
 
 // isTransient 判断上游错误是否值得重试。与前身实现的正则同源：
@@ -411,6 +440,59 @@ func isTransient(err error) bool {
 	return false
 }
 
+/* ---------- 流式保活 ---------- */
+
+// heartbeat 在伪流式的等待期里定期写 SSE 注释帧保活。
+//
+// 停止是同步的：Stop 返回后保证不会再有心跳写入 w。所以调用方不需要为
+// 「心跳与真实事件同时写」加锁——把 Stop 放在渲染器动笔之前就够了。
+// 少一把锁少一类交错 bug。
+type heartbeat struct {
+	stop chan struct{}
+	done chan struct{}
+}
+
+// startHeartbeat 起一个心跳协程。every 为 0 取默认间隔，负值直接关掉。
+func startHeartbeat(w io.Writer, every time.Duration) *heartbeat {
+	h := &heartbeat{stop: make(chan struct{}), done: make(chan struct{})}
+	if every < 0 {
+		close(h.done)
+		return h
+	}
+	if every == 0 {
+		every = defaultHeartbeatInterval
+	}
+	go func() {
+		defer close(h.done)
+		t := time.NewTicker(every)
+		defer t.Stop()
+		for {
+			select {
+			case <-h.stop:
+				return
+			case <-t.C:
+				if _, err := io.WriteString(w, keepaliveFrame); err != nil {
+					// 写失败说明客户端已经走了。停手即可：真正的收尾由
+					// ctx 取消驱动，心跳不该自己判断请求该不该继续。
+					return
+				}
+				// 不 Flush 等于没有心跳：字节会停在 net/http 的 4KB 缓冲里，
+				// 客户端仍然什么都收不到。
+				if f, ok := w.(interface{ Flush() }); ok {
+					f.Flush()
+				}
+			}
+		}
+	}()
+	return h
+}
+
+// Stop 停掉心跳并等它真的停下。只能调用一次。
+func (h *heartbeat) Stop() {
+	close(h.stop)
+	<-h.done
+}
+
 /* ---------- 渲染 ---------- */
 
 func (g *Gateway) render(sess *toolbridge.Session, decoded *toolbridge.Request, res *toolbridge.Result, clientModel string) ([]byte, error) {
@@ -420,6 +502,9 @@ func (g *Gateway) render(sess *toolbridge.Session, decoded *toolbridge.Request, 
 // HandleSSE 是 Handle 的流式版本：把结果渲染成客户端协议的 SSE 事件序列
 // 写进 w。事件形状完全正确（该有的 message_stop / [DONE] 一个不少），
 // 但第一个字要等上游说完——伪流式与闭环恢复互斥，这是当前架构的自觉取舍。
+//
+// 等待期不是静默的：心跳写 SSE 注释帧保住连接，否则客户端会在服务端仍在
+// 正常工作时先超时断开。
 //
 // 与 Handle 共用同一条编排循环；差异只在最后的渲染出口。
 func (g *Gateway) HandleSSE(ctx context.Context, protocolName string, body []byte, w io.Writer) error {
@@ -437,7 +522,13 @@ func (g *Gateway) HandleSSE(ctx context.Context, protocolName string, body []byt
 	if err != nil {
 		return err
 	}
+
+	// 从这里开始要等上游。心跳上岗，渲染器动笔之前必须停掉——Stop 是同步的，
+	// 返回后 w 又归渲染器独占，不需要锁。
+	hb := startHeartbeat(w, g.cfg.HeartbeatInterval)
 	res := g.loop(ctx, sess, decoded, sk, compiled.ToolsIncluded)
+	hb.Stop()
+
 	sr, err := sess.NewStreamRenderer(decoded, w, toolbridge.RenderOptions{Model: clientModel})
 	if err != nil {
 		return fmt.Errorf("gateway: 建立流式渲染失败：%w", err)

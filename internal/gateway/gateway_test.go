@@ -474,6 +474,113 @@ func TestGatewayRequestBudget(t *testing.T) {
 	}
 }
 
+// partialAdapter 每轮都返回部分文本 + 瞬态错误：模拟断流。
+// gateway 应在重试全部失败后把部分文本透传出去，而不是交空响应。
+type partialAdapter struct {
+	calls atomic.Int32
+}
+
+func (p *partialAdapter) Name() string { return "partial" }
+
+func (p *partialAdapter) Models(context.Context) ([]string, error) {
+	return []string{"mock-model"}, nil
+}
+
+func (p *partialAdapter) Complete(context.Context, string, []protocol.Message) (upstream.Reply, error) {
+	p.calls.Add(1)
+	return upstream.Reply{Text: "断流前已生成的部分文本", Status: 200},
+		errors.New("upstream: connection reset by peer")
+}
+
+func TestGatewayPartialTextSurvivesUpstreamFailure(t *testing.T) {
+	ad := &partialAdapter{}
+	g := gw(t, ad)
+
+	out, err := g.Handle(context.Background(), "chat", chatBody(t, false))
+	if err != nil {
+		t.Fatalf("断流不应杀死请求：%v", err)
+	}
+	if !strings.Contains(string(out), "断流前已生成的部分文本") {
+		t.Fatalf("部分文本被丢弃了：%s", truncate(out))
+	}
+	if got := ad.calls.Load(); got != maxUpstreamRetries+1 {
+		t.Fatalf("重试次数 = %d，期望 %d", got, maxUpstreamRetries+1)
+	}
+}
+
+// slowAdapter 先睡一会儿再照 signalAdapter 的脚本回答：模拟真实上游的
+// 思考时间，让心跳有机会上场。
+type slowAdapter struct {
+	delay time.Duration
+	inner signalAdapter
+}
+
+func (s *slowAdapter) Name() string { return "slow-ok" }
+
+func (s *slowAdapter) Models(context.Context) ([]string, error) { return []string{"mock-model"}, nil }
+
+func (s *slowAdapter) Complete(ctx context.Context, model string, msgs []protocol.Message) (upstream.Reply, error) {
+	select {
+	case <-time.After(s.delay):
+	case <-ctx.Done():
+		return upstream.Reply{}, ctx.Err()
+	}
+	return s.inner.Complete(ctx, model, msgs)
+}
+
+// TestGatewayHandleSSEHeartbeat 钉住伪流式等待期的保活帧。
+//
+// 没有它，客户端会在服务端仍在正常工作时先判定连接死掉：伪流式的第一个
+// 数据事件要等整轮上游（含阶梯追问）说完，而客户端的空闲阈值通常只有
+// 30-60 秒。断言三件事——心跳出现过、它排在第一个数据事件之前、
+// 它没有把事件序列本身弄脏（终止事件照常到达）。
+func TestGatewayHandleSSEHeartbeat(t *testing.T) {
+	g, err := New(Config{
+		Bridge:            bridge(t),
+		Adapter:           &slowAdapter{delay: 80 * time.Millisecond},
+		HeartbeatInterval: 10 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var buf bytes.Buffer
+	if err := g.HandleSSE(context.Background(), "chat", bodyFor(t, "chat", true), &buf); err != nil {
+		t.Fatalf("HandleSSE 失败：%v", err)
+	}
+	out := buf.String()
+
+	hb := strings.Index(out, ": texvoke keepalive")
+	if hb < 0 {
+		t.Fatalf("等待期没有心跳，客户端会先超时断开：\n%s", out)
+	}
+	if data := strings.Index(out, "data: "); data >= 0 && hb > data {
+		t.Fatalf("心跳排在数据事件之后，说明它没有覆盖等待期：\n%s", out)
+	}
+	if !strings.Contains(out, `"tool_calls"`) || !strings.Contains(out, "data: [DONE]") {
+		t.Fatalf("心跳污染了事件序列：\n%s", out)
+	}
+}
+
+// 心跳可以关掉：负间隔用于「客户端自己有保活」或调试对比。
+func TestGatewayHandleSSEHeartbeatDisabled(t *testing.T) {
+	g, err := New(Config{
+		Bridge:            bridge(t),
+		Adapter:           &slowAdapter{delay: 60 * time.Millisecond},
+		HeartbeatInterval: -1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	if err := g.HandleSSE(context.Background(), "chat", bodyFor(t, "chat", true), &buf); err != nil {
+		t.Fatalf("HandleSSE 失败：%v", err)
+	}
+	if strings.Contains(buf.String(), "keepalive") {
+		t.Fatal("负间隔应关闭心跳")
+	}
+}
+
 // bodyFor 按协议构造带工具的最小请求体。三协议的工具声明形状不同
 // （Chat 包一层 function、Anthropic 用 input_schema、Responses 平铺），
 // 工具名统一 write_file，signalAdapter 才认得。
