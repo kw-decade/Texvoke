@@ -704,12 +704,16 @@ const maxMergeHostBytes = 8 * 1024
 //
 //   - prefill（最后一条是 assistant）：合并进最后一条指令消息。不能在
 //     prefill 后面接任何东西——接了就等于改写客户端精心构造的开头。
-//   - 最后一条指令消息很小（≤ maxMergeHostBytes）：合并进去。说明贴着
-//     一段小指令，读起来是一体的规则；Codex 全部指令都是这种形状。
-//   - 最后一条指令消息很大（> maxMergeHostBytes）：独立成一条消息追加
-//     在末尾。Claude Code 的 hook 插件会注入几十 KB 的行为规则（怎么
-//     说话、怎么路由），说明拼在里面会被彻底淹没——模型读完几十 KB 的
-//     「怎么说话」就忘了「有什么工具」，实测 0/4。
+//   - 最后一条指令消息很小（≤ maxMergeHostBytes）且是普通指令：合并进去。
+//     说明贴着一段小指令，读起来是一体的规则；Codex 全部指令都是这种形状。
+//   - 其余情况：独立成一条消息追加在末尾。两类宿主不能合并——
+//     太大的（Claude Code 的 hook 插件注入几十 KB 行为规则，实测说明拼进去
+//     被淹没，0/4）；以及客户端的状态注入（turn_aborted 之类）。后者尤其
+//     要避开：Codex 在用户打断一轮后注入「工具可能被中断、可能只执行了一半」，
+//     协议说明紧贴着它，弱模型会把两段读成一件事——2026-08-26 实测有模型
+//     因此声称「当前运行时阻止了工具调用」并停手。状态注入描述的是运行时的
+//     异常，协议说明描述的是怎么用工具；拼在一起就是给「工具通道坏了」
+//     这个错误结论递证据。
 //
 // 独立成条时的角色：Chat / Responses 用 system（允许序列里多条 system，
 // 位置保持在末尾）；Anthropic 用 user——它的编码器会把 system 摘回顶层
@@ -726,7 +730,7 @@ func appendSystemFor(msgs []protocol.Message, add string, proto Protocol) []prot
 		if !msgs[i].Role.Instructional() {
 			continue
 		}
-		if len(msgs[i].Text()) <= maxMergeHostBytes {
+		if len(msgs[i].Text()) <= maxMergeHostBytes && !isClientStateNotice(msgs[i].Text()) {
 			return mergeIntoLastInstruction(msgs, add)
 		}
 		break
@@ -736,6 +740,21 @@ func appendSystemFor(msgs []protocol.Message, add string, proto Protocol) []prot
 		role = protocol.RoleUser
 	}
 	return append(msgs, textMessage(role, add))
+}
+
+// isClientStateNotice 报告一段宿主指令是不是客户端注入的运行时状态通告。
+//
+// 这类文本描述的是「刚才发生了什么异常」，与「怎么用工具」毫无关系；
+// 协议说明合并进去会让两个主题在模型眼里搅成一团。已知的形态都带显式
+// 标签（<turn_aborted> 等），按标签识别而不是按措辞猜——客户端加新形态
+// 时在这里补一行，比误判一段正常指令安全。
+func isClientStateNotice(text string) bool {
+	for _, tag := range []string{"<turn_aborted>", "<turn_diff>"} {
+		if strings.Contains(text, tag) {
+			return true
+		}
+	}
+	return false
 }
 
 // mergeIntoLastInstruction 把内容追加进最后一条指令消息，只在 prefill

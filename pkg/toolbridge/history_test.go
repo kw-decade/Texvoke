@@ -308,6 +308,89 @@ func TestStringContentUntouched(t *testing.T) {
 // 为什么需要它：协议说明在 system 里，而工具清单可能有十几 KB——真实
 // Codex 的一个 exec 描述就有 11 KB。实测 14 KB 清单配 1 KB 说明时，
 // 模型就不再按格式输出了，指令被稀释掉了。
+// 协议说明绝不合并进客户端的状态注入消息。
+//
+// 出处是 2026-08-26 的真实会话：Codex 在用户打断一轮后注入 <turn_aborted>
+// （内容：工具可能被中断、可能只执行了一半）。这条消息 1.7KB，在
+// maxMergeHostBytes 之内，协议说明被合并进去——两段紧挨着，弱模型把
+// 「你的工具可能被中断了」和「怎么用工具」读成一件事，随后声称
+// 「当前运行时阻止了工具调用」并停手。状态注入描述异常，协议说明描述用法，
+// 拼在一起就是给错误归因递证据。
+func TestInstructionsNeverMergeIntoClientStateNotice(t *testing.T) {
+	// Codex 第二轮的真实形状：permissions developer（27KB）在前，
+	// turn_aborted developer（1.7KB）在后。
+	mkBody := func() []byte {
+		return []byte(`{
+			"model":"m",
+			"input":[
+				{"type":"message","role":"developer","content":"<permissions instructions>` +
+			strings.Repeat("x", 9000) + `</permissions instructions>"},
+				{"type":"message","role":"developer","content":"<turn_aborted>\nThe previous turn was interrupted on purpose. Any running unified exec processes may still be running in the background.\n</turn_aborted>"},
+				{"type":"message","role":"user","content":"继续"}
+			],
+			"tools":[{"type":"custom","name":"exec","description":"run"}]
+		}`)
+	}
+	b, _ := New(Config{})
+	sess, _ := b.NewSession("s", "r")
+	req, err := DecodeRequest(ProtocolResponses, mkBody(), DecodeOptions{SessionID: "s", RequestID: "r"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := sess.CompileRequest(req, CompileOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, m := range req.Messages() {
+		txt := m.Text()
+		if strings.Contains(txt, "<turn_aborted>") && strings.Contains(txt, c.Signal) {
+			t.Fatalf("协议说明被合并进了 turn_aborted 消息：%s", truncateStr(txt, 300))
+		}
+	}
+	// 说明仍然要进对话——只是独立成条，且落在末尾。
+	last := req.Messages()[len(req.Messages())-1]
+	if !strings.Contains(last.Text(), c.Signal) {
+		t.Fatalf("协议说明丢了或不在末尾，最后一条是 [%s] %q",
+			last.Role, truncateStr(last.Text(), 200))
+	}
+
+	// 对照组：普通的小指令消息照旧合并——那条实测有效的路径不能被误伤。
+	b2, _ := New(Config{})
+	sess2, _ := b2.NewSession("s2", "r2")
+	req2, err := DecodeRequest(ProtocolResponses, []byte(`{
+		"model":"m",
+		"input":[
+			{"type":"message","role":"developer","content":"保持简洁。"},
+			{"type":"message","role":"user","content":"继续"}
+		],
+		"tools":[{"type":"custom","name":"exec","description":"run"}]
+	}`), DecodeOptions{SessionID: "s2", RequestID: "r2"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c2, err := sess2.CompileRequest(req2, CompileOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	merged := false
+	for _, m := range req2.Messages() {
+		if strings.Contains(m.Text(), "保持简洁") && strings.Contains(m.Text(), c2.Signal) {
+			merged = true
+		}
+	}
+	if !merged {
+		t.Fatal("普通小指令的合并路径被误伤，说明不再贴合宿主指令")
+	}
+}
+
+func truncateStr(s string, n int) string {
+	if len(s) > n {
+		return s[:n] + "…"
+	}
+	return s
+}
+
 func TestReminderLandsAtTheEnd(t *testing.T) {
 	t.Run("chat 用独立的 system 消息", func(t *testing.T) {
 		b, _ := New(Config{})
