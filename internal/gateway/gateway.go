@@ -311,6 +311,16 @@ func (g *Gateway) loop(ctx context.Context, sess *toolbridge.Session, decoded *t
 			g.log.Info("停止追问，按当前结果渲染", "reason", reason)
 			return res
 		}
+		// 模型这轮的纯文本回应先回灌进历史，再追加追问。
+		//
+		// 不回灌的后果：下一轮请求里模型看不到自己刚说过什么——它的叙述
+		// 凭空消失，取而代之的是一条追问。弱模型于是把每一轮都当成「第一次
+		// 面对这个问题」，重复同样的话；L1-L4 五连全部无效的实测里，
+		// 每轮 49-90 秒的生成都是在认真重写同一段汇报。回灌之后它至少
+		// 看得到「我已经解释过了」，才有可能切换到行动。
+		if t := res.Text; strings.TrimSpace(t) != "" {
+			decoded.AppendMessages([]toolbridge.RecoveryMessage{{Role: "assistant", Text: t}})
+		}
 		// 针对性追加，不是重发同一个 prompt。
 		decoded.AppendMessages(msgs)
 	}

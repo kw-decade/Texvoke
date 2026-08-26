@@ -79,6 +79,11 @@ type Evidence struct {
 	// 调用方通常直接传 HasSuccessfulHistory || (ToolChoice != "") 的结果；
 	// 单独提供是为了让「模式判断」这个决策可以被显式测试。
 	AgentMode bool
+
+	// SystemRecovery 决定追问消息的投递角色：置位用 system，否则 user。
+	// 网关直连上游时置位（上游方言是 chat，允许多条 system）；sidecar
+	// 保持 false——它的调用方可能把追问编码回 Anthropic，那里只允许一条。
+	SystemRecovery bool
 }
 
 func (e Evidence) toInternal(res *Result, parseErr error) capability.Evidence {
@@ -195,7 +200,19 @@ func (s *Session) Diagnose(res *Result, parseErr error, ev Evidence) Diagnosis {
 // RemedyRepairFormat（发了信号但写错）不走阶梯：模型已理解协议，把具体
 // 错误翻译给它即可。其余 Remedy 一律不重试：FixClient 要人改配置，
 // Backoff 是传输层的事（红线 8），FailSafe 与 Downgrade 意味着到此为止。
+//
+// 追问的投递角色由 ev.SystemRecovery 决定：置位时用 system——「运行时通知」
+// 必须真的是运行时的嗓门。2026-08-26 长程实测发现 user 角色会毁掉这套设计：
+// 结果回填轮的历史以 user 消息（工具结果）结尾，追问再以 user 追加，
+// 弱模型把整个序列读成「用户在连续说话」，继续对话续写而不是响应系统事件，
+// L1-L4 五连全部无效。system 角色让「环境在报错」从内容变成结构。
+// 默认 false 保持 sidecar 的无状态兼容（它的调用方可能编码回 Anthropic，
+// 那里只允许一条 system）；网关直连上游时置位。
 func (s *Session) Recover(d Diagnosis, res *Result, parseErr error, tools []string, ev Evidence) (Recovery, error) {
+	role := "user"
+	if ev.SystemRecovery {
+		role = "system"
+	}
 	switch d.Remedy {
 	case "capability_handshake", "no_call_hint":
 		// 阶梯深度就是调用方传来的尝试计数，这里不做二次推算：单请求内
@@ -211,9 +228,9 @@ func (s *Session) Recover(d Diagnosis, res *Result, parseErr error, tools []stri
 			msg := capability.HandshakeMessageFor(tools)
 			return Recovery{
 				ShouldRetry: true,
-				Messages:    []RecoveryMessage{{Role: "user", Text: msg}},
-				// 说明发在 user 里而不是 system：它是「关于运行环境的一句话」，
-				// 不是格式规范；而且 system 在 Anthropic 上只允许一条。
+				Messages:    []RecoveryMessage{{Role: role, Text: msg}},
+				// 角色由 ev.SystemRecovery 决定（见函数注释）：网关直连上游时
+				// 用 system 让能力说明以运行时身份出现。
 				HandshakeDone: true,
 				Reason:        "L1：模型误以为自己不能执行，做一次诚实的能力说明",
 			}, nil
@@ -225,7 +242,7 @@ func (s *Session) Recover(d Diagnosis, res *Result, parseErr error, tools []stri
 			}
 			return Recovery{
 				ShouldRetry: true,
-				Messages:    []RecoveryMessage{{Role: "user", Text: hint.Text}},
+				Messages:    []RecoveryMessage{{Role: role, Text: hint.Text}},
 				Reason:      "L2：运行时通知——陈述信号缺失的事实",
 			}, nil
 
@@ -236,7 +253,7 @@ func (s *Session) Recover(d Diagnosis, res *Result, parseErr error, tools []stri
 			}
 			return Recovery{
 				ShouldRetry: true,
-				Messages:    []RecoveryMessage{{Role: "user", Text: hint.Text}},
+				Messages:    []RecoveryMessage{{Role: role, Text: hint.Text}},
 				Reason:      "L3：附完整可照抄的调用示例",
 			}, nil
 
@@ -247,7 +264,7 @@ func (s *Session) Recover(d Diagnosis, res *Result, parseErr error, tools []stri
 			}
 			return Recovery{
 				ShouldRetry: true,
-				Messages:    []RecoveryMessage{{Role: "user", Text: hint.Text}},
+				Messages:    []RecoveryMessage{{Role: role, Text: hint.Text}},
 				Reason:      "L4：明示该任务需要一次工具操作",
 			}, nil
 		}
@@ -260,7 +277,7 @@ func (s *Session) Recover(d Diagnosis, res *Result, parseErr error, tools []stri
 		}
 		return Recovery{
 			ShouldRetry: true,
-			Messages:    []RecoveryMessage{{Role: "user", Text: hint.Text}},
+			Messages:    []RecoveryMessage{{Role: role, Text: hint.Text}},
 			Reason:      "把具体的格式错误反馈给模型",
 		}, nil
 

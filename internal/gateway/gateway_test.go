@@ -223,6 +223,65 @@ func TestGatewayLadderRecoversThenSucceeds(t *testing.T) {
 	}
 }
 
+// 追问的投递角色保持 user。
+//
+// 2026-08-26 曾试过改成 system（「运行时通知」应该是运行时的嗓门），
+// utr-eval 实测 codex-stuck 从 6/6 跌到 0/6——这个真实上游对尾部 system
+// 消息的处理让追问完全失效。回退，但 Evidence.SystemRecovery 字段保留：
+// sidecar 的调用方可以按自己的上游显式选择。
+func TestGatewayRecoveryKeepsUserRole(t *testing.T) {
+	ad := &signalAdapter{refuseFirst: atomicBool(true)}
+	g := gw(t, ad)
+
+	if _, err := g.Handle(context.Background(), "chat", chatBody(t, true)); err != nil {
+		t.Fatalf("Handle 失败：%v", err)
+	}
+	found := false
+	for _, m := range ad.lastMsgs {
+		if m.Role == protocol.RoleUser && strings.Contains(m.Text(), "关于你的运行环境") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("追问未以 user 角色到达上游：")
+		for _, m := range ad.lastMsgs {
+			t.Logf("  [%s] %.40s", m.Role, m.Text())
+		}
+	}
+}
+
+// 模型上一轮的失败回应必须回灌进历史，再追加追问。
+//
+// 出处：2026-08-26 长程实测，L1-L4 五连全部无效。当时每轮请求里只有追问、
+// 没有模型自己刚说过的话——它的叙述凭空消失，每一轮都被当成「第一次面对
+// 这个问题」，用 49-90 秒认真重写同一段汇报。回灌之后它至少看得到
+// 「我已经解释过了」，才有切换到行动的可能。
+func TestGatewayReplaysFailedResponseBeforeHint(t *testing.T) {
+	ad := &signalAdapter{refuseFirst: atomicBool(true)}
+	g := gw(t, ad)
+
+	if _, err := g.Handle(context.Background(), "chat", chatBody(t, true)); err != nil {
+		t.Fatalf("Handle 失败：%v", err)
+	}
+	// 第二次上游调用（追问轮）收到的消息序列里，模型第一轮的拒绝原文
+	// 应以 assistant 角色出现在追问之前。
+	rejected := "我无法直接操作你的文件系统，请你自己在终端执行。"
+	sawAssistant := false
+	sawHintAfter := false
+	for _, m := range ad.lastMsgs {
+		if m.Role == protocol.RoleAssistant && strings.Contains(m.Text(), rejected) {
+			sawAssistant = true
+		}
+		if sawAssistant && m.Role == protocol.RoleUser && strings.Contains(m.Text(), "关于你的运行环境") {
+			sawHintAfter = true
+		}
+	}
+	if !sawAssistant || !sawHintAfter {
+		t.Fatalf("失败回应未回灌或顺序不对：assistant回灌=%v 追问在其后=%v",
+			sawAssistant, sawHintAfter)
+	}
+}
+
 func atomicBool(v bool) *atomic.Value {
 	var a atomic.Value
 	a.Store(v)

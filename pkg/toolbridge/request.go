@@ -276,8 +276,13 @@ func (r *Request) AppendMessages(msgs []RecoveryMessage) {
 	cur := r.msgs()
 	for _, m := range msgs {
 		role := protocol.RoleUser
-		if m.Role == "system" {
+		switch m.Role {
+		case "system":
 			role = protocol.RoleSystem
+		case "assistant":
+			// 网关把模型上一轮的失败回应回灌进历史时用：让模型看到
+			// 「自己已经说过什么」，而不是每轮都面对一个凭空出现的追问。
+			role = protocol.RoleAssistant
 		}
 		b, err := json.Marshal(m.Text)
 		if err != nil {
