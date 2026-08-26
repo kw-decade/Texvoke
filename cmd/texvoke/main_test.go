@@ -9,6 +9,8 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -32,6 +34,13 @@ func (f fakeUpstream) Complete(context.Context, string, []protocol.Message) (ups
 
 func (f fakeUpstream) Models(context.Context) ([]string, error) {
 	return []string{"fake-model"}, nil
+}
+
+// failUpstream 的模型清单拉取永远失败，用于钉住 /v1/models 的 502 路径。
+type failUpstream struct{ fakeUpstream }
+
+func (f failUpstream) Models(context.Context) ([]string, error) {
+	return nil, fmt.Errorf("upstream: 连接失败")
 }
 
 func testGateway(t *testing.T) *gateway.Gateway {
@@ -147,5 +156,55 @@ func TestSplitList(t *testing.T) {
 	}
 	if splitList("") != nil {
 		t.Fatal("空串应返回 nil 而不是空切片——nil 才让 CompileOptions 走默认路径")
+	}
+}
+
+// TestListModelsShape 钉住 /v1/models 的响应形状。
+//
+// 这条有实战出处：CC Switch 加供应商时提示「该供应商不支持获取模型列表」，
+// 原因是 data 元素给了裸字符串而不是完整对象，且缺 CORS 头——Electron 渲染
+// 进程发的请求在浏览器层就被拦了，服务端日志一片干净。三个形状约束一个都
+// 不能少，退化成任何一个，坏的方式都是在客户端静默失败。
+func TestListModelsShape(t *testing.T) {
+	log := slog.New(slog.DiscardHandler)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	listModels(fakeUpstream{}, log)(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("状态码 = %d", rec.Code)
+	}
+	if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "*" {
+		t.Fatalf("缺 CORS 头，Electron 客户端会在浏览器层被拦：%q", got)
+	}
+	var body struct {
+		Object string `json:"object"`
+		Data   []struct {
+			ID      string `json:"id"`
+			Object  string `json:"object"`
+			Created int64  `json:"created"`
+			OwnedBy string `json:"owned_by"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("响应不是合法 JSON：%v", err)
+	}
+	if len(body.Data) != 1 || body.Data[0].ID != "fake-model" {
+		t.Fatalf("data 应为完整对象数组：%+v", body.Data)
+	}
+	if body.Data[0].Object != "model" || body.Data[0].OwnedBy == "" {
+		t.Fatalf("data 元素缺字段，按 m.id 之外的字段取值的客户端会静默失败：%+v", body.Data[0])
+	}
+}
+
+// TestListModelsUpstreamFailure 上游清单不可用时回 502。
+// 装作有模型会让客户端在第一次请求时才炸，不如现在就说清楚。
+func TestListModelsUpstreamFailure(t *testing.T) {
+	log := slog.New(slog.DiscardHandler)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	listModels(failUpstream{}, log)(rec, req)
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("上游不可用应回 502，得到 %d", rec.Code)
 	}
 }

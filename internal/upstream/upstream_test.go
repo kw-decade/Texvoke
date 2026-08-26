@@ -79,6 +79,50 @@ func TestOpenAIChatComplete(t *testing.T) {
 	}
 }
 
+// TestOpenAIChatModels 钉住模型清单的两件事：端点从 chat/completions 推导到
+// 同源的 /models（网关不编名字，答案来自上游），以及响应按 OpenAI 形状解析。
+func TestOpenAIChatModels(t *testing.T) {
+	var gotPath, gotAuth string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotAuth = r.Header.Get("authorization")
+		w.Header().Set("content-type", "application/json")
+		_, _ = w.Write([]byte(`{"object":"list","data":[
+			{"id":"model-a","object":"model","created":1,"owned_by":"x"},
+			{"id":"model-b","object":"model","created":1,"owned_by":"x"}]}`))
+	}))
+	defer srv.Close()
+
+	ad := OpenAIChat{Endpoint: srv.URL + "/v1/chat/completions", APIKey: "sk-test"}
+	names, err := ad.Models(context.Background())
+	if err != nil {
+		t.Fatalf("Models 失败：%v", err)
+	}
+	if gotPath != "/v1/models" {
+		t.Fatalf("端点推导错：%q，期望 /v1/models", gotPath)
+	}
+	if gotAuth != "Bearer sk-test" {
+		t.Fatalf("鉴权头 = %q", gotAuth)
+	}
+	if len(names) != 2 || names[0] != "model-a" || names[1] != "model-b" {
+		t.Fatalf("模型名单 = %v", names)
+	}
+}
+
+// 上游清单不可用必须显式报错，装作有模型会让客户端在第一次请求时才炸。
+func TestOpenAIChatModelsUpstreamError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"error":{"message":"country not supported","type":"policy"}}`))
+	}))
+	defer srv.Close()
+
+	ad := OpenAIChat{Endpoint: srv.URL}
+	if _, err := ad.Models(context.Background()); err == nil {
+		t.Fatal("上游清单不可用必须报错")
+	}
+}
+
 func TestOpenAIChatUpstreamError(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusForbidden)
