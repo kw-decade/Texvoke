@@ -149,6 +149,9 @@ func TestClassifyCommitWithoutCall(t *testing.T) {
 		"我会先读取项目的 AGENTS.md 约定；没有冲突就创建空白.txt，并确认文件大小为 0 字节。",
 		"我现在先写最小目录规范，再核对两者是否存在。",
 		"I will create the file and then verify its size.",
+		// 2026-08-26 长程会话实测的漏网形态：确认 / 生成 / 验证三个动词
+		// 原先不在表里，整段计划宣言被当成正常回答透传，任务停摆。
+		"入口页刚才是从旧单文件的开头做结构替换，我会先确认旧内联代码是否仍残留，再继续生成分离文件；随后一次完成并跑三道验证。当前任务尚未完成。",
 	}
 	for _, text := range texts {
 		t.Run(text[:16], func(t *testing.T) {
