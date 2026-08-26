@@ -72,6 +72,13 @@ type Evidence struct {
 	// （反代检测 input 中有无 tool call item）。L2 用它反驳
 	// 「调用接口不可用」的自我错觉——用已发生的事实，不用评价语气。
 	HasSuccessfulHistory bool
+
+	// AgentMode 表示会话正处于 agent 工作循环：历史里有成功调用，
+	// 或客户端要求必须调用。置位时零调用直接走阶梯，文本内容不再是
+	// 判定输入——自然语言词表永远在补措辞漂移的漏，结构性证据不会。
+	// 调用方通常直接传 HasSuccessfulHistory || (ToolChoice != "") 的结果；
+	// 单独提供是为了让「模式判断」这个决策可以被显式测试。
+	AgentMode bool
 }
 
 func (e Evidence) toInternal(res *Result, parseErr error) capability.Evidence {
@@ -98,6 +105,7 @@ func (e Evidence) toInternal(res *Result, parseErr error) capability.Evidence {
 		ParseErrorKind:        parseKind,
 		ModelText:             e.ModelText,
 		HandshakeDone:         e.HandshakeDone,
+		AgentMode:             e.AgentMode,
 	}
 }
 

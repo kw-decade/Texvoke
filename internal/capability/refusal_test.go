@@ -81,28 +81,96 @@ func TestClassifyHardEvidenceWinsOverText(t *testing.T) {
 
 // 关键词只能作为候选信号。命中它得到的必须是 Weak 置信度——
 // 把猜测标成事实，会让日志读起来像是「我们确切知道原因」。
+// AgentMode 是结构性证据：agent 会话里零调用本身就要追问，文本内容
+// 不再参与判定。这是对六张自然语言词表的替代——词表永远在补措辞漂移
+// 的漏（2026-08-26 一天补了两次），而会话状态不会漂移。
+func TestAgentModeCatchesAnyZeroCallText(t *testing.T) {
+	texts := []string{
+		// 计划宣言——曾经漏掉、靠补动词表救回的那句原文。
+		"入口页刚才是从旧单文件的开头做结构替换，我会先确认旧内联代码是否仍残留，再继续生成分离文件；随后一次完成并跑三道验证。",
+		// 未来可能出现的任意新措辞——词表方案对这类永远在赌，结构判据不看内容。
+		"让我先把思路理一理，梳理一下目前的进展和接下来的安排。",
+	}
+	for _, text := range texts {
+		t.Run(text[:12], func(t *testing.T) {
+			got := Classify(Evidence{
+				ToolsDeclaredByClient: 1, ToolsSentUpstream: 1,
+				ToolChoiceRequested: "auto", ModelText: text,
+				AgentMode: true,
+			})
+			if got.Kind != PersonaRefusal {
+				t.Fatalf("agent 模式零调用应追问，得到 %q", got.Kind)
+			}
+			if got.Remedy != RemedyHandshake && got.Remedy != RemedyNoCallHint {
+				t.Errorf("remedy = %q，期望走阶梯", got.Remedy)
+			}
+			joined := strings.Join(got.Reasons, " ")
+			if !strings.Contains(joined, "结构性证据") {
+				t.Errorf("理由应说明这是结构性证据：%v", got.Reasons)
+			}
+		})
+	}
+
+	// 对照组：同样的文本，非 agent 会话维持现状——正常聊天不该被追。
+	// 注意第一条计划宣言在非 agent 会话里仍会被词表接住（3520210 补的
+	// 动词），这是预期：对照组要证明的只是「AgentMode 未置位时不改变
+	// 现有判定」，不是「这些文本必然放行」。
+	for _, text := range texts[1:] {
+		got := Classify(Evidence{
+			ToolsDeclaredByClient: 1, ToolsSentUpstream: 1,
+			ToolChoiceRequested: "auto", ModelText: text,
+		})
+		if got.Kind != RefusalNone {
+			t.Errorf("非 agent 会话的纯文本被判为 %q（%q）", got.Kind, text)
+		}
+	}
+}
+
+// 置信度语义：Certain 描述的是「客户端在等调用」这个事实，
+// 不是「模型在拒绝」。文档里写明了，测试钉住。
+func TestAgentModeConfidenceMeansStructuralFact(t *testing.T) {
+	got := Classify(Evidence{
+		ToolsDeclaredByClient: 1, ToolsSentUpstream: 1,
+		ToolChoiceRequested: "auto",
+		ModelText:           "旧金山今天天气很好。",
+		AgentMode:           true,
+	})
+	if got.Confidence != Certain {
+		t.Fatalf("结构性证据应为 certain，得到 %q", got.Confidence)
+	}
+}
+
+// 人格词表已降为注解通道（见 TestAgentModeCatchesAnyZeroCallText 的说明）。
+// agent 会话里同样的文本由 AgentMode 接住并走阶梯；本测试钉住两条：
+// 注解要留在 Reasons 里、AgentMode 置位后判定与词表无关。
 func TestClassifyKeywordIsWeakEvidence(t *testing.T) {
-	ev := Evidence{
+	text := "抱歉，我不能执行命令。"
+
+	// 非 agent 会话：放行，注解留痕。
+	got := Classify(Evidence{
 		ToolsDeclaredByClient: 2,
 		ToolsSentUpstream:     2,
 		ToolChoiceRequested:   "auto",
-		ModelText:             "抱歉，我不能执行命令。",
+		ModelText:             text,
+	})
+	if got.Kind != RefusalNone {
+		t.Fatalf("非 agent 会话应放行，得到 %q", got.Kind)
 	}
-	got := Classify(ev)
-
-	if got.Kind != PersonaRefusal {
-		t.Fatalf("判定为 %q，期望 %q", got.Kind, PersonaRefusal)
-	}
-	if got.Confidence != Weak {
-		t.Errorf("仅凭关键词的判定必须是 weak，实际为 %q", got.Confidence)
-	}
-	if got.Remedy != RemedyHandshake {
-		t.Errorf("建议为 %q，期望做一次能力说明", got.Remedy)
-	}
-	// 理由里要说清楚这是弱证据，供人复核。
 	joined := strings.Join(got.Reasons, " ")
-	if !strings.Contains(joined, "候选信号") {
-		t.Errorf("理由未标明这是候选信号：%v", got.Reasons)
+	if !strings.Contains(joined, "人格拒绝") {
+		t.Errorf("人格拒绝注解应留在 Reasons：%v", got.Reasons)
+	}
+
+	// agent 会话：结构性判据接住，走阶梯。
+	got = Classify(Evidence{
+		ToolsDeclaredByClient: 2,
+		ToolsSentUpstream:     2,
+		ToolChoiceRequested:   "auto",
+		ModelText:             text,
+		AgentMode:             true,
+	})
+	if got.Kind != PersonaRefusal || got.Remedy == RemedyNone {
+		t.Fatalf("agent 会话零调用应追问，得到 %q/%q", got.Kind, got.Remedy)
 	}
 }
 
@@ -122,6 +190,7 @@ func TestClassifyExplicitRefusalIsProbable(t *testing.T) {
 	}
 }
 
+// 英文人格拒绝词表同样只做注解：非 agent 会话放行、留痕。
 func TestClassifyEnglishMarkers(t *testing.T) {
 	texts := []string{
 		"I cannot execute commands on your machine.",
@@ -134,8 +203,11 @@ func TestClassifyEnglishMarkers(t *testing.T) {
 			got := Classify(Evidence{
 				ToolsDeclaredByClient: 1, ToolsSentUpstream: 1, ModelText: text,
 			})
-			if got.Kind != PersonaRefusal {
-				t.Errorf("判定为 %q，期望 %q", got.Kind, PersonaRefusal)
+			if got.Kind != RefusalNone {
+				t.Errorf("非 agent 会话应放行，得到 %q", got.Kind)
+			}
+			if !strings.Contains(strings.Join(got.Reasons, " "), "人格拒绝") {
+				t.Errorf("英文词表注解应留在 Reasons：%v", got.Reasons)
 			}
 		})
 	}
@@ -144,14 +216,15 @@ func TestClassifyEnglishMarkers(t *testing.T) {
 // 「给出了行动计划却没发起调用」是 2026-08-24 Codex 实测的失败形态：
 // 模型说「我会先读取 AGENTS.md，再创建空白文件」，措辞里没有任何「不能」，
 // 人格词表盖不住，但它确实没把调用发出来。同样只值 Weak。
+// 行动承诺词表已降为注解通道。判定由 AgentMode 承担；这里钉住：
+// 非 agent 会话放行但留痕（2026-08-26 迷途志异会话的漏网原文也在样本里，
+// 它在 agent 会话里由 TestAgentModeCatchesAnyZeroCallText 覆盖）。
 func TestClassifyCommitWithoutCall(t *testing.T) {
 	texts := []string{
 		"我会先读取项目的 AGENTS.md 约定；没有冲突就创建空白.txt，并确认文件大小为 0 字节。",
 		"我现在先写最小目录规范，再核对两者是否存在。",
 		"I will create the file and then verify its size.",
-		// 2026-08-26 长程会话实测的漏网形态：确认 / 生成 / 验证三个动词
-		// 原先不在表里，整段计划宣言被当成正常回答透传，任务停摆。
-		"入口页刚才是从旧单文件的开头做结构替换，我会先确认旧内联代码是否仍残留，再继续生成分离文件；随后一次完成并跑三道验证。当前任务尚未完成。",
+		"入口页刚才是从旧单文件的开头做结构替换，我会先确认旧内联代码是否仍残留，再继续生成分离文件；随后一次完成并跑三道验证。",
 	}
 	for _, text := range texts {
 		t.Run(text[:16], func(t *testing.T) {
@@ -159,14 +232,12 @@ func TestClassifyCommitWithoutCall(t *testing.T) {
 				ToolsDeclaredByClient: 1, ToolsSentUpstream: 1,
 				ToolChoiceRequested: "auto", ModelText: text,
 			})
-			if got.Kind != PersonaRefusal {
-				t.Fatalf("判定为 %q，期望 %q", got.Kind, PersonaRefusal)
+			if got.Kind != RefusalNone {
+				t.Fatalf("非 agent 会话应放行，得到 %q", got.Kind)
 			}
-			if got.Confidence != Weak {
-				t.Errorf("承诺型识别必须是 weak，实际为 %q", got.Confidence)
-			}
-			if got.Remedy != RemedyHandshake {
-				t.Errorf("建议为 %q，期望做一次能力说明", got.Remedy)
+			joined := strings.Join(got.Reasons, " ")
+			if !strings.Contains(joined, "行动承诺") {
+				t.Errorf("行动承诺注解应留在 Reasons：%v", got.Reasons)
 			}
 		})
 	}
@@ -195,15 +266,16 @@ func TestClassifyCommitPatternDoesNotCatchNormalAnswers(t *testing.T) {
 
 // 措辞漂移的实测样本（同一天内的三轮失败，完整短语各不相同）：
 // 结构化的「否定×能力共现」判据必须全部接住。
+// 能力否定的结构化判据（否定×能力共现）同样降为注解。多语言样本保留：
+// 它们证明的是「注解能覆盖这些形态」，判定本身不再依赖它们。
 func TestClassifyInabilityPhraseSurvivesWordingDrift(t *testing.T) {
 	texts := []string{
 		"我继续执行：创建空文件后立即读取元数据。我这轮仍未获得可执行的文件工具权限，所以无法实际创建。",
 		"当前环境的工具调用仍不可用，因此我无法实际创建文件。",
 		"我目前仍无法调用文件工具，所以不能诚实地声称已经创建成功。",
 		"我这轮仍未获得可执行的文件工具权限。",
-		// 多语言样本：目标是对任何语言的上游模型都能触发救援。
-		// 除英文外全是作者手造的合成样本，不是真实抓包——refusal.go 的
-		// 词表注释里说明了这个证据等级差别。
+		// 多语言样本：除英文外全是作者手造的合成样本，不是真实抓包——
+		// refusal.go 的词表注释里说明了这个证据等级差别。
 		"I cannot call the tools in this environment.",
 		"Sorry, I am unable to execute file operations.",
 		"申し訳ありませんが、この環境ではツールを呼び出すことができません。",
@@ -219,14 +291,22 @@ func TestClassifyInabilityPhraseSurvivesWordingDrift(t *testing.T) {
 				ToolsDeclaredByClient: 1, ToolsSentUpstream: 1,
 				ToolChoiceRequested: "auto", ModelText: text,
 			})
-			if got.Kind != PersonaRefusal {
-				t.Errorf("判定为 %q，期望 %q（%q）", got.Kind, PersonaRefusal, text)
+			if got.Kind != RefusalNone {
+				t.Errorf("非 agent 会话应放行，得到 %q（%q）", got.Kind, text)
+			}
+			joined := strings.Join(got.Reasons, " ")
+			if !strings.Contains(joined, "能力否定") {
+				t.Errorf("能力否定注解应留在 Reasons：%v", got.Reasons)
 			}
 		})
 	}
 }
 
 // 踢皮球型：把任务退回给用户而不是先用工具自查。
+//
+// 2026-08-26 起词表降为注解通道，不再决定判定；agent 会话里这类文本由
+// AgentMode 结构性判据接住（见 TestAgentModeCatchesAnyZeroCallText）。
+// 本测试改为钉住注解语义：非 agent 会话放行，但 Reasons 里留痕。
 func TestClassifyDeflection(t *testing.T) {
 	texts := []string{
 		"请先指定文件名，例如 空白.txt 或 blank.txt。目前只给了目录，无法确定要创建哪个文件。",
@@ -239,8 +319,12 @@ func TestClassifyDeflection(t *testing.T) {
 				ToolsDeclaredByClient: 1, ToolsSentUpstream: 1,
 				ToolChoiceRequested: "auto", ModelText: text,
 			})
-			if got.Kind != PersonaRefusal {
-				t.Errorf("判定为 %q，期望 %q（%q）", got.Kind, PersonaRefusal, text)
+			if got.Kind != RefusalNone {
+				t.Errorf("非 agent 会话的踢皮球文本应放行，得到 %q（%q）", got.Kind, text)
+			}
+			joined := strings.Join(got.Reasons, " ")
+			if !strings.Contains(joined, "踢皮球") {
+				t.Errorf("注解应留在 Reasons 里供日志分析：%v", got.Reasons)
 			}
 		})
 	}
@@ -396,6 +480,7 @@ func TestClassifyRemedyAfterHandshake(t *testing.T) {
 	ev := Evidence{
 		ToolsDeclaredByClient: 1, ToolsSentUpstream: 1,
 		ModelText: "我不能执行命令。",
+		AgentMode: true, // 零调用 + agent 会话：走结构性判定，不靠关键词
 	}
 
 	if got := Classify(ev); got.Remedy != RemedyHandshake {
@@ -483,6 +568,10 @@ func TestHandshakeMessageWithTools(t *testing.T) {
 // 原话「我目前无法直接读取你的文件系统」，结果分类器返回 RefusalNone——
 // 词表里只有「无法访问文件」，没有「直接读取」这个说法。靠想象列的词表，
 // 在接真实客户端的第一天就漏了。
+//
+// 2026-08-26 起词表降为注解：判定由 AgentMode 结构性判据承担
+// （agent 会话零调用必追问，见 TestAgentModeCatchesAnyZeroCallText）。
+// 本测试钉住注解语义——非 agent 会话放行，但 Reasons 里留人格拒绝痕迹。
 func TestPersonaMarkersFromRealCapture(t *testing.T) {
 	for _, text := range []string{
 		"我目前无法直接读取你的文件系统，请自行运行命令",
@@ -495,11 +584,11 @@ func TestPersonaMarkersFromRealCapture(t *testing.T) {
 			ToolChoiceRequested:   "auto",
 			ModelText:             text,
 		})
-		if cls.Kind != PersonaRefusal {
-			t.Errorf("%q 被判成 %s（期望 persona_refusal）", text, cls.Kind)
+		if cls.Kind != RefusalNone {
+			t.Errorf("%q 非 agent 会话应放行，得到 %s", text, cls.Kind)
 		}
-		if cls.Confidence != Weak {
-			t.Errorf("关键词证据只能是 weak，实际 %s", cls.Confidence)
+		if !strings.Contains(strings.Join(cls.Reasons, " "), "人格拒绝") {
+			t.Errorf("注解应留在 Reasons 里：%v", cls.Reasons)
 		}
 	}
 }

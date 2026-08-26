@@ -54,6 +54,9 @@ type recoverRequest struct {
 		Attempt int `json:"attempt,omitempty"`
 		// HasSuccessfulHistory：请求历史里已有成功送出的调用。
 		HasSuccessfulHistory bool `json:"has_successful_history,omitempty"`
+		// AgentMode：会话正处于 agent 工作循环。留空时服务端按
+		// HasSuccessfulHistory（并上会话状态）推导，与网关同判据。
+		AgentMode *bool `json:"agent_mode,omitempty"`
 	} `json:"evidence"`
 }
 
@@ -143,6 +146,19 @@ func (s *server) handleRecover(w http.ResponseWriter, r *http.Request) {
 			ev.HandshakeDone = snap.HandshakeDone || req.Evidence.HandshakeDone
 			ev.HasSuccessfulHistory = snap.HasCalls || ev.HasSuccessfulHistory
 		}
+	}
+	// AgentMode 判据与 internal/gateway 同源：历史有成功调用、客户端要求
+	// 必须调用（required/named/any）、或本轮编译出了工具清单（声明工具 =
+	// 客户端具备执行能力）。调用方显式给的值优先——它可能掌握服务端
+	// 看不到的事实。
+	switch {
+	case req.Evidence.AgentMode != nil:
+		ev.AgentMode = *req.Evidence.AgentMode
+	default:
+		tc := ev.ToolChoice
+		ev.AgentMode = ev.HasSuccessfulHistory ||
+			tc == "required" || tc == "named" || tc == "any" ||
+			len(req.Tools) > 0
 	}
 
 	d := sess.Diagnose(res, parseErr, ev)

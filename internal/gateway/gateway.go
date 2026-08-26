@@ -347,10 +347,16 @@ func (g *Gateway) recover(sess *toolbridge.Session, decoded *toolbridge.Request,
 			ev.Attempt = level
 			ev.HandshakeDone = snap.HandshakeDone
 			ev.HasSuccessfulHistory = snap.HasCalls
+			// agent 模式是结构性证据：会话历史里有成功调用、客户端要求必须
+			// 调用、或客户端声明了工具（声明工具 = 客户端具备执行能力，
+			// 它就在 agent 场景里）——三者任一成立时，零调用本身就是追问的
+			// 充分条件，文本内容不参与判定。词表只留给日志注解。
+			ev.AgentMode = snap.HasCalls || decoded.RequireCall() || len(toolsIncluded) > 0
 		}
 	} else {
 		// 无会话键（理论上 gateway 总有）：退化为单请求内 L1。
 		ev.Attempt = 1
+		ev.AgentMode = decoded.RequireCall()
 	}
 	if ladderExhausted {
 		return false, nil, "突破阶梯已用尽：连续多轮拒绝调用，如实上报而不是继续追问"

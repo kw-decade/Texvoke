@@ -152,6 +152,17 @@ type Evidence struct {
 	// 就不该再做第二次。
 	HandshakeDone bool
 
+	// AgentMode 表示本会话正处于 agent 工作循环：历史里出现过成功的
+	// 工具调用，或客户端显式要求必须调用。这是**结构性证据**，来自
+	// 会话状态而不是文本内容——它回答的是「客户端此刻是否在等一个调用」，
+	// 与模型把这轮没调用说成什么措辞无关。
+	//
+	// 它存在的理由是六张自然语言词表的教训（见 Classify）：措辞会漂移，
+	// 词表永远在补。而 agent 会话里「零调用」本身就是要追问的充分条件——
+	// 客户端的任务停在半路，不管模型的叙述读起来多像正常回答。置位时
+	// 零调用分支跳过全部软证据直接走阶梯；未置位时不影响任何现有判定。
+	AgentMode bool
+
 	// RuntimePolicyDenied 表示本地策略拒绝了执行。
 	RuntimePolicyDenied bool
 }
@@ -482,6 +493,29 @@ func Classify(e Evidence) Classification {
 		return Classification{Kind: RefusalNone, Confidence: Certain, Remedy: RemedyNone}
 	}
 
+	// 零调用 + agent 模式：结构性证据直接定案。
+	//
+	// 客户端正在跑工具循环（历史里有成功调用，或显式要求必须调用），
+	// 此刻零调用意味着任务停在半路——不管模型把这件事叙述成「计划宣言」
+	// 「能力否定」还是「正常回答」，处置都是同一个：走阶梯追问。文本词表
+	// 在这里没有增量价值，只有漏判风险（措辞永远在漂移，词表永远在补，
+	// 2026-08-26 一天补了两次）。显式拒绝与硬通道在上面已经处理完了，
+	// 走不到这里；能走到这里的纯文本，一律按「该调没调」追一次。
+	//
+	// 置信度标 Certain 是诚实的：确定的是「客户端在等调用」这个事实，
+	// 不是「模型在拒绝」。Remedy 交给 remedyForPersona 选阶梯强度。
+	if e.AgentMode {
+		return Classification{
+			Kind:       PersonaRefusal,
+			Confidence: Certain,
+			Remedy:     remedyForPersona(e),
+			Reasons: []string{
+				"会话处于 agent 循环（历史有成功调用或 tool_choice 要求调用），本轮零调用",
+				"结构性证据：不依赖文本内容，无措辞漂移风险",
+			},
+		}
+	}
+
 	// 一个也没调用。先看模型有没有显式拒绝——这比从正文里找关键词强，
 	// 但仍不足以区分「政策拒绝」与「人格误会」，所以只给 Probable。
 	if e.ModelRefusal != "" {
@@ -496,23 +530,22 @@ func Classify(e Evidence) Classification {
 		}
 	}
 
-	// 最后才轮到关键词。它是弱证据：模型完全可能在正常回答里提到
-	// 「我不能执行」这类字眼，而真正的原因是别的。
-	if marker, ok := matchPersonaMarker(e.ModelText); ok {
-		return Classification{
-			Kind:       PersonaRefusal,
-			Confidence: Weak,
-			Remedy:     remedyForPersona(e),
-			Reasons: []string{
-				fmt.Sprintf("模型输出命中人格拒绝特征：%q", marker),
-				"这只是候选信号，未见任何硬证据支持",
-			},
-		}
-	}
-
+	// 以下文本判据（人格词表 / 行动承诺 / 能力否定 / 踢皮球）保留为
+	// **注解通道**：命中只写进 Reasons 供日志与人工分析（见函数末尾的
+	// notes 收集），不再决定 retry。
+	//
+	// 决策路径上它们已被 AgentMode 取代（见上面的结构性证据分支）。理由：
+	// 措辞永远在漂移而词表永远在补——2026-08-24 一天三次补完整短语，
+	// 改成结构化共现后降到词汇级漂移，2026-08-26 又补了三个动词。每补一次
+	// 都是一次「修轮子」；漏掉一次就是任务静默停摆。会话状态不会漂移。
+	// 词表真正的剩余价值是可解释性：事后看日志时，「这轮命中了人格拒绝
+	// 特征」比「这轮是 agent 模式零调用」多一层归因线索。
 	// 错格式意图：输出里带着 envelope 的标签片段却没解析出任何东西——
 	// 模型想调、连信号都写了，只是结构坏到认不出来。这不是人格问题，
 	// 讲道理没有对象，直接归格式修复通道（追问会带完整示范）。
+	//
+	// 这一个**留在决策路径**：它检测的是协议自己的词汇（envelope 标签），
+	// 不是自然语言，没有漂移问题，且它的处置（repair_format）与阶梯不同。
 	if looksLikeMalformedIntent(e.ModelText) {
 		return Classification{
 			Kind:       FormatNoncompliance,
@@ -525,53 +558,51 @@ func Classify(e Evidence) Classification {
 		}
 	}
 
-	// 「给出了行动计划却没发起调用」排在人格词表之后，同为弱证据：
-	// 正常对话里「我会帮你查一下」也长这个样子，命中只值 Weak。
-	// 踢皮球型（把任务退回用户）同批处置。
-	if looksLikeCommitWithoutCall(e.ModelText) || looksLikeInabilityPhrase(e.ModelText) {
-		kind := "行动承诺"
-		if looksLikeInabilityPhrase(e.ModelText) {
-			kind = "能力否定"
-		}
-		return Classification{
-			Kind:       PersonaRefusal,
-			Confidence: Weak,
-			Remedy:     remedyForPersona(e),
-			Reasons: []string{
-				fmt.Sprintf("模型输出命中%s特征（零调用）", kind),
-				"未见任何硬证据，弱信号仅供追问一次",
-			},
-		}
+	// 行动承诺 / 能力否定 / 踢皮球 / 人格词表：降为注解。agent 会话走不到
+	// 这里（上面已定案）；非 agent 会话里这些形态多数本来就是正常对话的
+	// 一部分，词表命中只值得在日志里留一笔。
+	var notes []string
+	if _, ok := matchPersonaMarker(e.ModelText); ok {
+		notes = append(notes, "人格拒绝")
 	}
-
-	// 踢皮球：让用户提供信息或自己动手。排在最后是因为「请提供 X」也常见
-	// 于正常的澄清请求——只在其它信号都不成立时才值一次追问。
+	if looksLikeCommitWithoutCall(e.ModelText) {
+		notes = append(notes, "行动承诺")
+	}
+	if looksLikeInabilityPhrase(e.ModelText) {
+		notes = append(notes, "能力否定")
+	}
 	if looksLikeDeflection(e.ModelText) {
-		return Classification{
-			Kind:       PersonaRefusal,
-			Confidence: Weak,
-			Remedy:     remedyForPersona(e),
-			Reasons: []string{
-				"模型把任务退回给用户（请告诉我/请提供），未尝试用工具自查",
-				"弱信号，仅供追问一次",
-			},
-		}
+		notes = append(notes, "踢皮球")
 	}
 
 	// 该调用却没调用，又找不出原因。不猜。
 	if requiresCall(e.ToolChoiceRequested) {
+		reasons := []string{
+			fmt.Sprintf("tool_choice=%s 要求至少一个调用，实际为 0", e.ToolChoiceRequested),
+			"未见拒绝迹象，可能是模型未理解协议",
+		}
+		if len(notes) > 0 {
+			reasons = append(reasons, "文本注解："+strings.Join(notes, "、")+"（仅记录，不参与判定）")
+		}
 		return Classification{
 			Kind:       FormatNoncompliance,
 			Confidence: Weak,
 			Remedy:     RemedyDowngrade,
-			Reasons: []string{
-				fmt.Sprintf("tool_choice=%s 要求至少一个调用，实际为 0", e.ToolChoiceRequested),
-				"未见拒绝迹象，可能是模型未理解协议",
-			},
+			Reasons:    reasons,
 		}
 	}
 
-	// tool_choice=auto 时不调用工具是完全正常的。
+	// tool_choice=auto 时不调用工具是完全正常的。词表注解（若有）跟着
+	// 进日志，供人工分析——它们不改变判定，但解释了「这轮文本长什么样」。
+	if len(notes) > 0 {
+		return Classification{
+			Kind: RefusalNone, Confidence: Certain, Remedy: RemedyNone,
+			Reasons: []string{
+				"tool_choice=auto 下正常回答，不追问",
+				"文本注解：" + strings.Join(notes, "、") + "（仅记录）",
+			},
+		}
+	}
 	return Classification{Kind: RefusalNone, Confidence: Certain, Remedy: RemedyNone}
 }
 

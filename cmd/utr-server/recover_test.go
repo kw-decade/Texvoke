@@ -76,8 +76,12 @@ func TestRecoverEndpoint(t *testing.T) {
 	})
 
 	t.Run("正常回答 → 不追问", func(t *testing.T) {
-		rec := post(t, s.handleRecover, "/v1/recover", recoverReq(
-			n, toolbridge.OutcomePlainText, "今天天气不错", "", false))
+		// 「今天天气不错」是纯聊天：调用方明确告知 agent_mode=false
+		//（真实场景里这个客户端没声明工具、历史也没有调用）。
+		no := false
+		req := recoverReq(n, toolbridge.OutcomePlainText, "今天天气不错", "", false)
+		req.Evidence.AgentMode = &no
+		rec := post(t, s.handleRecover, "/v1/recover", req)
 		out := decodeJSON[struct {
 			Kind        string `json:"kind"`
 			ShouldRetry bool   `json:"should_retry"`

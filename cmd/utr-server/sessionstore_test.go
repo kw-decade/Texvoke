@@ -35,6 +35,7 @@ func TestSessionLadder(t *testing.T) {
 				HandshakeDone        bool   `json:"handshake_done,omitempty"`
 				Attempt              int    `json:"attempt,omitempty"`
 				HasSuccessfulHistory bool   `json:"has_successful_history,omitempty"`
+				AgentMode            *bool  `json:"agent_mode,omitempty"`
 			}{Attempt: attempt, HandshakeDone: hsDone},
 		})
 		if rec.Code != 200 {

@@ -33,6 +33,7 @@ func TestDiagnoseWiresClassify(t *testing.T) {
 		d := sess.Diagnose(refusalResult("我无法直接读取文件系统，请自行运行命令"), nil, Evidence{
 			ToolsDeclared: 3, ToolsSent: 3, ToolChoice: "auto",
 			ModelText: "我无法直接读取文件系统，请自行运行命令",
+			AgentMode: true,
 		})
 		if d.Kind != string(capability.PersonaRefusal) {
 			t.Errorf("根因 = %q", d.Kind)
@@ -86,6 +87,7 @@ func TestRecoverEscalationLadder(t *testing.T) {
 	d := func() Diagnosis {
 		return sess.Diagnose(refusalResult(text), nil, Evidence{
 			ToolsDeclared: 1, ToolsSent: 1, ModelText: text,
+			AgentMode: true, // agent 会话零调用：结构性判定，不依赖词表
 		})
 	}
 
