@@ -106,7 +106,9 @@ func (c OpenAIChat) Complete(ctx context.Context, model string, messages []proto
 
 	text, err := accumulateChatStream(resp.Body)
 	if err != nil {
-		return Reply{Status: resp.StatusCode}, err
+		// 断流前已累积的文本跟着错误一起交回去。accumulateChatStream 特意
+		// 保留了它，这里丢掉就等于白留——调用方靠它做降级透传。
+		return Reply{Text: text, Status: resp.StatusCode}, err
 	}
 	return Reply{Text: text, Status: resp.StatusCode}, nil
 }
@@ -158,6 +160,9 @@ func (c OpenAIChat) Models(ctx context.Context) ([]string, error) {
 }
 
 // accumulateChatStream 读完整条 SSE 流并拼出模型文本。
+//
+// 流中断时返回已收到的部分文本 + 错误——断前的内容不该跟着断流一起消失，
+// 调用方（gateway）拿它做降级透传。完整成功时 error 为 nil。
 func accumulateChatStream(r io.Reader) (string, error) {
 	acc := protocol.NewChatStreamAccumulator(protocol.DecodeOptions{})
 	dec := protocol.NewSSEDecoder(bufio.NewReaderSize(r, 64<<10), protocol.SSEDecoderOptions{})
@@ -172,10 +177,10 @@ func accumulateChatStream(r io.Reader) (string, error) {
 			break
 		}
 		if err != nil {
-			return "", fmt.Errorf("upstream: SSE 解析失败：%w", err)
+			return acc.PartialText(), fmt.Errorf("upstream: SSE 解析失败：%w", err)
 		}
 		if err := acc.Add(*ev); err != nil {
-			return "", fmt.Errorf("upstream: %w", err)
+			return acc.PartialText(), fmt.Errorf("upstream: %w", err)
 		}
 		if acc.Done() {
 			break
@@ -184,7 +189,9 @@ func accumulateChatStream(r io.Reader) (string, error) {
 
 	resp, err := acc.Result()
 	if err != nil {
-		return "", fmt.Errorf("upstream: %w", err)
+		// 流断在中途：交出断前已收到的文本。空文本时错误原样返回，
+		// 有文本时错误也保留——调用方靠 err != nil 区分「完整」与「残缺」。
+		return acc.PartialText(), fmt.Errorf("upstream: %w", err)
 	}
 	if resp.Refusal != "" {
 		return "", &protocol.UpstreamError{Message: resp.Refusal, Type: "refusal"}

@@ -206,6 +206,13 @@ func (a *ChatStreamAccumulator) addToolCallDeltas(raw json.RawMessage) error {
 // Done 报告是否已收到终止标记。
 func (a *ChatStreamAccumulator) Done() bool { return a.done }
 
+// PartialText 返回断流前已经累积到的正文文本。
+//
+// 用途：上游中途断开时，已生成的文本不该跟着一起扔。调用方拿它做降级
+// 透传——半截回答也比让用户等完一整轮重生成强。只在流未正常结束时
+// 调用才有意义；正常结束时用 Result。
+func (a *ChatStreamAccumulator) PartialText() string { return a.content.String() }
+
 // Result 把累积结果组装成完整响应。
 //
 // 参数直到这一步才被解析：累积期间它只是一串可能被切碎的字节。解析失败

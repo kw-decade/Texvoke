@@ -11,8 +11,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/kw-decade/Texvoke/internal/protocol"
@@ -103,8 +105,53 @@ func TestOpenAIChatTruncatedStreamFails(t *testing.T) {
 	defer srv.Close()
 
 	ad := OpenAIChat{Endpoint: srv.URL}
-	_, err := ad.Complete(context.Background(), "m", chatMessages())
+	reply, err := ad.Complete(context.Background(), "m", chatMessages())
 	if err == nil {
 		t.Fatal("流中断必须报错而不是返回半截文本")
+	}
+	// 断前已生成的内容不该跟着断流一起消失：调用方（gateway）拿它做降级透传。
+	if reply.Text != "半截" {
+		t.Fatalf("部分文本丢失：got %q, want %q", reply.Text, "半截")
+	}
+}
+
+// errAfterReader 先交出全部数据，再报一个传输层错误。
+//
+// 这是真实断流的形状：字节已经进了客户端缓冲，连接才死。用 io.Reader 而不是
+// 真 TCP 断连来模拟，是因为「服务端 close 时客户端缓冲里还剩多少」由内核决定，
+// 各平台不一致，测出来的会是脚手架行为而不是产品行为。
+type errAfterReader struct {
+	r   io.Reader
+	err error
+}
+
+func (e *errAfterReader) Read(p []byte) (int, error) {
+	n, err := e.r.Read(p)
+	if err == io.EOF {
+		if n > 0 {
+			return n, nil
+		}
+		return 0, e.err
+	}
+	return n, err
+}
+
+// 断流前的部分文本必须跟着错误一起交回来。上游已经生成的内容不该因为
+// 最后一个 chunk 丢失就全部作废——调用方拿它做降级透传。
+//
+// 与上面那条的区别：这里是传输层报错（connection reset），走的是
+// dec.Next() 的错误分支；上面是干净 EOF，走 acc.Result() 的未正常结束分支。
+// 两条都会丢文本，必须分别钉住。
+func TestAccumulateChatStreamKeepsPartialTextOnTransportError(t *testing.T) {
+	body := `data: {"id":"c1","choices":[{"index":0,"delta":{"content":"断流前"}}]}` + "\n\n" +
+		`data: {"id":"c1","choices":[{"index":0,"delta":{"content":"的半截"}}]}` + "\n\n"
+	r := &errAfterReader{r: strings.NewReader(body), err: errors.New("connection reset by peer")}
+
+	text, err := accumulateChatStream(r)
+	if err == nil {
+		t.Fatal("传输层报错必须显式失败")
+	}
+	if text != "断流前的半截" {
+		t.Fatalf("部分文本丢失：got %q, want %q", text, "断流前的半截")
 	}
 }
