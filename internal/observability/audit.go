@@ -125,7 +125,7 @@ func ProposalEvent(kind EventKind, p ir.ToolCallProposal, tenant string) Event {
 }
 
 // ResultEvent 随执行结果一起删除：本项目不执行工具，看不到落定状态与耗时。
-// 见 internal/ir/result.go 的说明。
+// （原说明所在的 internal/ir/result.go 已随 2026-08-25 的审计一并删除。）
 
 // Auditor 把审计事件写进日志。
 //

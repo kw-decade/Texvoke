@@ -79,12 +79,31 @@ func (s *SessionStore) Snapshot(key string) SessionState {
 	return SessionState{}
 }
 
-// Succeed 标记一次成功：调用已产出，阶梯归位。直接删除而不是归零——
-// 下次卡住时从 L1 重新开始，与全新会话行为一致。
+// Succeed 标记一次成功：调用已产出，阶梯归位到 0，下次卡住时重新从头爬。
+//
+// **只归零 Level，不删整条状态**。早先这里是 `delete(s.m, key)`，把
+// HandshakeDone 与 HasCalls 一起抹掉，后果有两条，2026-09-01 真实 codex
+// 长程实测都印证了：
+//
+//   - 违反「澄清只允许一次」：同一个对话里 L1 能力说明出现了 4 次，每次都
+//     紧跟在一次成功调用之后。每多一次 L1 就多一次上游往返（实测 8-15 秒），
+//     而模型早就被说明过了。
+//   - 丢掉 HasCalls：那是 L2 用来反驳「调用接口不可用」的证据，也是
+//     AgentMode 的结构性依据之一。刚刚成功过的会话反而「忘了自己成功过」，
+//     恰好是最需要这份证据的场景。
+//
+// 这和 get() 里那条注释说的是同一个错误（sidecar 版在防洪时连活跃会话的
+// HandshakeDone 一起清），当时只修了 get，这里漏了。
+//
+// 键空间的代价：成功的会话现在会留一条记录而不是被删掉。每条三个字段，
+// 2000 条上限下可以忽略；换来的是「说明过的话不再重说」。
 func (s *SessionStore) Succeed(key string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	delete(s.m, key)
+	st := s.get(key)
+	st.Level = 0
+	// 刚产出的这次调用本身就是「这个会话能调用工具」的证据。
+	st.HasCalls = true
 }
 
 // get 取出或惰性创建状态。调用方必须已持锁。

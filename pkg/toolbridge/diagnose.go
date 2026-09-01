@@ -223,6 +223,16 @@ func (s *Session) Recover(d Diagnosis, res *Result, parseErr error, tools []stri
 		if level < 1 {
 			level = 1
 		}
+		// 握手做过就不再重做。L1 的内容模型已经完整看过一遍，重复它只是多
+		// 一次上游往返（实测 8-15 秒），而且是最没有新信息的那一次。
+		//
+		// remedyForPersona 早就是这个意图（HandshakeDone → NoCallHint），但
+		// 级数此前只看 Attempt，于是意图在这里被覆盖：诊断说走 L2，实际发出
+		// 的还是 L1。2026-09-01 真实 codex 长程实测暴露——「成功 → 阶梯归位
+		// → 再拒绝」的循环里 L1 出现了 4 次。
+		if level <= 1 && ev.HandshakeDone {
+			level = 2
+		}
 		switch {
 		case level <= 1:
 			msg := capability.HandshakeMessageFor(tools)

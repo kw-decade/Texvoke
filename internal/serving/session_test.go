@@ -21,7 +21,13 @@ func TestSessionLadderAdvancesAndCaps(t *testing.T) {
 	}
 }
 
-func TestSessionSucceedResets(t *testing.T) {
+// 成功后阶梯归位，但**已经说明过的事实必须留下**。
+//
+// 2026-09-01 真实 codex 长程实测：旧实现在这里 delete 整条状态，同一个对话
+// 里 L1 能力说明出现了 4 次，每次都紧跟一次成功调用之后——模型早被说明过，
+// 却要为此再付一次上游往返（实测 8-15 秒）。HasCalls 同样被抹掉，而它正是
+// L2 反驳「调用接口不可用」的证据。
+func TestSessionSucceedResetsLadderButKeepsFacts(t *testing.T) {
 	s := NewSessionStore()
 	const key = "sess-B"
 	s.Advance(key)
@@ -30,11 +36,20 @@ func TestSessionSucceedResets(t *testing.T) {
 
 	s.Succeed(key)
 
-	if snap := s.Snapshot(key); snap.Level != 0 || snap.HandshakeDone {
-		t.Fatalf("成功后应完全归位，得到 %+v", snap)
+	snap := s.Snapshot(key)
+	if snap.Level != 0 {
+		t.Fatalf("阶梯应归位到 0，得到 %d", snap.Level)
 	}
+	if !snap.HandshakeDone {
+		t.Fatal("HandshakeDone 被抹掉了：同一个会话会被反复做能力说明")
+	}
+	if !snap.HasCalls {
+		t.Fatal("刚产出的调用本身就是「这个会话能调用工具」的证据，不该丢")
+	}
+	// 阶梯本身从头爬（下次卡住先给最轻的手段），但因为 HandshakeDone 还在，
+	// capability 侧会跳过 L1 直接走 L2 运行时通知。
 	if got, _ := s.Advance(key); got != 1 {
-		t.Fatalf("归位后应从 L1 重新开始，得到 L%d", got)
+		t.Fatalf("归位后阶梯应从 1 重新开始，得到 L%d", got)
 	}
 }
 

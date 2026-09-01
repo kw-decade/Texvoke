@@ -254,6 +254,21 @@ func (sr *StreamRenderer) finishStreamed(res Result) error {
 
 /* ---------- 三协议的响应构造 ---------- */
 
+// Proposals 返回本次结果对应的调用提案，与渲染给客户端的那一组逐字相同。
+//
+// 存在的理由是审计：调用方要记「模型提出了什么」时，记的 call_id 必须与
+// 客户端实际收到的那个一致，否则日志里的调用与客户端回传的结果对不上，
+// 审计链在最关键的一环断掉。自己按 Result.Calls 重造一份 ID 做不到这点
+// （deterministicCallID 依赖会话 nonce），所以这里把同一份构造暴露出来。
+//
+// 不含 Responses 专用的 item id：那是渲染阶段的协议细节，与审计无关。
+func (s *Session) Proposals(res *Result) []ir.ToolCallProposal {
+	if res == nil {
+		return nil
+	}
+	return proposals(s, res)
+}
+
 func chatResponse(s *Session, req *Request, res *Result, opts RenderOptions) protocol.ChatResponse {
 	return protocol.ChatResponse{
 		ID: idOr(opts.ID, "chatcmpl_"), Model: modelOr(opts.Model, req),

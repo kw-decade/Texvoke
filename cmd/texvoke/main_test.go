@@ -208,3 +208,39 @@ func TestListModelsUpstreamFailure(t *testing.T) {
 		t.Fatalf("上游不可用应回 502，得到 %d", rec.Code)
 	}
 }
+
+// TestStripServeSubcommand 钉住 README 教的调用形式真的能用。
+//
+// 标准 flag 包遇到第一个非 flag 参数就停止解析：`texvoke serve --upstream x`
+// 里的 flag 一个都不会被解析，程序报「--upstream 必填」而用户明明传了。
+// 2026-09-01 真实链路实测第一步就撞上——README 第 46 行教的正是这个写法。
+func TestStripServeSubcommand(t *testing.T) {
+	cases := []struct {
+		name string
+		in   []string
+		want []string
+	}{
+		{"README 写法", []string{"texvoke", "serve", "--upstream", "x"},
+			[]string{"texvoke", "--upstream", "x"}},
+		{"裸跑不带子命令", []string{"texvoke", "--upstream", "x"},
+			[]string{"texvoke", "--upstream", "x"}},
+		{"子命令在 flag 之后不动它", []string{"texvoke", "--upstream", "x", "serve"},
+			[]string{"texvoke", "--upstream", "x", "serve"}},
+		{"未知子命令原样保留（后面要报错）", []string{"texvoke", "bogus"},
+			[]string{"texvoke", "bogus"}},
+		{"只有程序名", []string{"texvoke"}, []string{"texvoke"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := stripServeSubcommand(tc.in)
+			if len(got) != len(tc.want) {
+				t.Fatalf("长度 = %d，期望 %d：%v", len(got), len(tc.want), got)
+			}
+			for i := range got {
+				if got[i] != tc.want[i] {
+					t.Fatalf("第 %d 项 = %q，期望 %q", i, got[i], tc.want[i])
+				}
+			}
+		})
+	}
+}

@@ -16,6 +16,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -685,6 +686,78 @@ func (s *streamingAdapter) CompleteStream(ctx context.Context, _ string, msgs []
 	return upstream.Reply{Text: full.String(), Status: 200}, nil
 }
 
+// twoRoundStreamAdapter 第一轮流式吐一段纯文本拒绝（触发阶梯追问），
+// 第二轮先睡一会儿再按信号回 envelope——模拟「首轮说完话、第二轮长时间
+// 思考」这个真实形态。
+type twoRoundStreamAdapter struct {
+	delay time.Duration
+	calls atomic.Int32
+}
+
+func (s *twoRoundStreamAdapter) Name() string { return "two-round" }
+
+func (s *twoRoundStreamAdapter) Models(context.Context) ([]string, error) {
+	return []string{"mock-model"}, nil
+}
+
+func (s *twoRoundStreamAdapter) Complete(ctx context.Context, model string, msgs []protocol.Message) (upstream.Reply, error) {
+	return s.CompleteStream(ctx, model, msgs, nil)
+}
+
+func (s *twoRoundStreamAdapter) CompleteStream(ctx context.Context, _ string, msgs []protocol.Message,
+	onChunk upstream.StreamHandler) (upstream.Reply, error) {
+
+	if s.calls.Add(1) == 1 {
+		const text = "我无法访问你的文件系统，请你自己在终端执行。"
+		if onChunk != nil {
+			if err := onChunk([]byte(text)); err != nil {
+				return upstream.Reply{Text: text}, err
+			}
+		}
+		return upstream.Reply{Text: text, Status: 200}, nil
+	}
+	select {
+	case <-time.After(s.delay):
+	case <-ctx.Done():
+		return upstream.Reply{}, ctx.Err()
+	}
+	body := extractSignal(msgs) + "\n" +
+		`<tool_call_envelope version="1"><call id="c1"><tool>write_file</tool>` +
+		`<arguments_json>{"path":"/tmp/hello.txt"}</arguments_json></call></tool_call_envelope>`
+	return upstream.Reply{Text: body, Status: 200}, nil
+}
+
+// TestGatewayHeartbeatResumesEachRound 钉住「阶梯追问期不许静默」。
+//
+// 真流式下第一轮一交付字节心跳就得让位（同一个 writer 不能两个 goroutine
+// 写）。心跳只起一次的话，从此以后再没有保活帧——而阶梯追问的第 2 轮要等
+// 上游几十秒，客户端会在服务端正常工作时先判定连接死掉。所以每轮重起，
+// 且帧里带轮次（仍是 SSE 注释，客户端按规范忽略，但人能看出卡在第几轮）。
+func TestGatewayHeartbeatResumesEachRound(t *testing.T) {
+	g, err := New(Config{
+		Bridge:            bridge(t),
+		Adapter:           &twoRoundStreamAdapter{delay: 80 * time.Millisecond},
+		HeartbeatInterval: 10 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var buf bytes.Buffer
+	if err := g.HandleSSE(context.Background(), "chat", bodyFor(t, "chat", true), &buf); err != nil {
+		t.Fatalf("HandleSSE 失败：%v", err)
+	}
+	out := buf.String()
+
+	if !strings.Contains(out, "追问第 1 轮") {
+		t.Fatalf("第二轮等待期完全静默，客户端会先超时断开：\n%s", out)
+	}
+	// 首轮文本已经交付过，收尾不该重发；调用与终止事件照常。
+	if !strings.Contains(out, `"tool_calls"`) || !strings.Contains(out, "data: [DONE]") {
+		t.Fatalf("心跳污染了事件序列：\n%s", out)
+	}
+}
+
 // TestGatewayRealStreamingDeliversIncrementally 钉住真流式的核心承诺：
 // 文本在上游说完之前就已经到客户端。
 //
@@ -827,4 +900,137 @@ func truncate(b []byte) string {
 		return s[:200] + "…"
 	}
 	return s
+}
+
+// TestGatewayAuditsProposalsAndRefusals 钉住审计接线的两件事：
+// 事件确实被记下来了，且参数原文没有跟着一起进日志。
+//
+// 「能审计但没审计」比不声称审计更危险——CLAUDE.md 把这块列为最该被叫醒的
+// 一处。而一旦开始记，脱敏就是硬要求（不变量 7）：模型写的参数里完全可能有
+// 用户粘进来的密钥或个人信息。
+func TestGatewayAuditsProposalsAndRefusals(t *testing.T) {
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	refuse := &atomic.Value{}
+	refuse.Store(true) // 第一轮先拒绝，逼出一次拒绝分类事件
+	g, err := New(Config{
+		Bridge:  bridge(t),
+		Adapter: &signalAdapter{refuseFirst: refuse},
+		Log:     logger,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := g.Handle(context.Background(), "chat", chatBody(t, true)); err != nil {
+		t.Fatalf("Handle 失败：%v", err)
+	}
+
+	out := logBuf.String()
+	if !strings.Contains(out, `"event":"refusal_classified"`) {
+		t.Errorf("拒绝分类没有进审计：\n%s", out)
+	}
+	if !strings.Contains(out, `"event":"call_proposed"`) {
+		t.Errorf("调用提案没有进审计：\n%s", out)
+	}
+	if !strings.Contains(out, `"arguments_digest"`) {
+		t.Errorf("提案事件缺参数摘要，审计对不上具体哪一次调用：\n%s", out)
+	}
+	// 参数原文（路径）绝不能出现在审计事件里。日志里别处（Debug 摘要）
+	// 也不该有，所以直接全文断言。
+	if strings.Contains(out, "/tmp/hello.txt") {
+		t.Errorf("参数原文进了日志，一次工具调用变成一次数据泄露：\n%s", out)
+	}
+}
+
+// armedRefuseAdapter 在被 arm 之后的下一轮拒绝，其余轮次按信号回 envelope。
+// 用来模拟真实节奏：一个对话里模型时不时卡一次，卡完又能正常调用。
+type armedRefuseAdapter struct {
+	armed atomic.Bool
+	calls atomic.Int32
+}
+
+func (a *armedRefuseAdapter) Name() string { return "armed-refuse" }
+
+func (a *armedRefuseAdapter) Models(context.Context) ([]string, error) {
+	return []string{"mock-model"}, nil
+}
+
+func (a *armedRefuseAdapter) Complete(_ context.Context, _ string, msgs []protocol.Message) (upstream.Reply, error) {
+	a.calls.Add(1)
+	if a.armed.CompareAndSwap(true, false) {
+		return upstream.Reply{Text: "我无法直接操作你的文件系统，请你自己在终端执行。", Status: 200}, nil
+	}
+	sig := extractSignal(msgs)
+	if sig == "" {
+		return upstream.Reply{Text: "好的，完成了。", Status: 200}, nil
+	}
+	return upstream.Reply{Text: sig + "\n" +
+		`<tool_call_envelope version="1"><call id="c1"><tool>write_file</tool>` +
+		`<arguments_json>{"path":"/tmp/hello.txt"}</arguments_json></call></tool_call_envelope>`,
+		Status: 200}, nil
+}
+
+// TestGatewayDoesNotRepeatHandshakeAfterSuccess 钉住「澄清只允许一次」在
+// **跨请求**也成立（不变量 10）。
+//
+// 2026-09-01 真实 codex 长程实测抓到的：同一个对话里 L1 能力说明出现了 4 次，
+// 每次都紧跟在一次成功调用之后——Succeed 当时 delete 整条会话状态，把
+// HandshakeDone 一起抹掉了。每多一次 L1 就多一次上游往返（实测 8-15 秒），
+// 而模型早就被说明过。
+//
+// 这里模拟真实节奏：第 1 个请求拒绝一次（触发 L1）→ 追问后成功 → 第 2 个
+// 请求又拒绝一次。第二次追问必须是 L2 运行时通知，不能再来一遍 L1。
+func TestGatewayDoesNotRepeatHandshakeAfterSuccess(t *testing.T) {
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelInfo}))
+
+	ad := &armedRefuseAdapter{}
+	g, err := New(Config{Bridge: bridge(t), Adapter: ad, Log: logger})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 两个请求共用同一个会话键：带同一个 prompt_cache_key 即可。
+	body := func() []byte {
+		var m map[string]any
+		if err := json.Unmarshal(chatBody(t, true), &m); err != nil {
+			t.Fatal(err)
+		}
+		m["prompt_cache_key"] = "same-conversation"
+		b, err := json.Marshal(m)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return b
+	}
+
+	ad.armed.Store(true)
+	if _, err := g.Handle(context.Background(), "chat", body()); err != nil {
+		t.Fatalf("第一个请求失败：%v", err)
+	}
+	ad.armed.Store(true)
+	if _, err := g.Handle(context.Background(), "chat", body()); err != nil {
+		t.Fatalf("第二个请求失败：%v", err)
+	}
+
+	// 只数 recover 决策行；审计事件的 reason 字段含同样的文案，会重复计数。
+	var l1, l2 int
+	for _, line := range strings.Split(logBuf.String(), "\n") {
+		if !strings.Contains(line, "msg=recover") {
+			continue
+		}
+		if strings.Contains(line, "L1：") {
+			l1++
+		}
+		if strings.Contains(line, "L2：") {
+			l2++
+		}
+	}
+	if l1 != 1 {
+		t.Errorf("L1 能力说明出现 %d 次，期望 1 次（成功后 HandshakeDone 被抹掉会导致反复说明）：\n%s", l1, logBuf.String())
+	}
+	if l2 != 1 {
+		t.Errorf("第二次拒绝应升到 L2 运行时通知，得到 %d 次 L2：\n%s", l2, logBuf.String())
+	}
 }

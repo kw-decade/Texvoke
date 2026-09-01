@@ -67,6 +67,15 @@ const defaultHeartbeatInterval = 15 * time.Second
 // keepaliveFrame 是心跳写出的字节。SSE 注释帧，一个字节的语义都没有。
 const keepaliveFrame = ": texvoke keepalive\n\n"
 
+// roundKeepaliveFrame 是阶梯追问期间的心跳帧。仍然是 SSE 注释（客户端按
+// 规范忽略），但人在看原始流或日志时能分辨「卡住了」和「在第几轮重试」。
+func roundKeepaliveFrame(round int) string {
+	if round <= 0 {
+		return keepaliveFrame
+	}
+	return fmt.Sprintf(": texvoke keepalive (追问第 %d 轮，等待上游)\n\n", round)
+}
+
 // Config 配置一个网关实例。
 type Config struct {
 	Bridge *toolbridge.Bridge
@@ -97,9 +106,10 @@ type Config struct {
 
 // Gateway 是配置完成的网关。Handle 并发安全。
 type Gateway struct {
-	cfg  Config
-	log  *slog.Logger
-	sess *serving.SessionStore
+	cfg   Config
+	log   *slog.Logger
+	sess  *serving.SessionStore
+	audit *observability.Auditor
 }
 
 // New 创建网关。
@@ -114,7 +124,11 @@ func New(cfg Config) (*Gateway, error) {
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Gateway{cfg: cfg, log: log, sess: serving.NewSessionStore()}, nil
+	return &Gateway{
+		cfg: cfg, log: log,
+		sess:  serving.NewSessionStore(),
+		audit: observability.NewAuditor(log),
+	}, nil
 }
 
 // withBudget 给一次请求套上墙钟预算。返回的 cancel 必须被调用。
@@ -273,7 +287,7 @@ func (g *Gateway) adapt(proto toolbridge.Protocol, sessionID, requestID string, 
 // newHandler 在每轮开始时被调用一次，返回该轮的增量接收器（可以是 nil，
 // 表示这一轮不做增量交付）。传 nil 表示整条循环都不做流式。
 func (g *Gateway) loop(ctx context.Context, sess *toolbridge.Session, decoded *toolbridge.Request,
-	sk string, toolsIncluded []string, newHandler func() upstream.StreamHandler) *toolbridge.Result {
+	sk string, toolsIncluded []string, newHandler func(round int) upstream.StreamHandler) *toolbridge.Result {
 
 	// last 保留上一轮已经拿到的结果。上游中途失败或墙钟预算耗尽时把它交出去，
 	// 而不是丢掉重来——阶梯第三轮挂掉不该让前两轮的文本一起消失。
@@ -282,7 +296,7 @@ func (g *Gateway) loop(ctx context.Context, sess *toolbridge.Session, decoded *t
 	for round := 0; round < maxRecoverRounds; round++ {
 		var onChunk upstream.StreamHandler
 		if newHandler != nil {
-			onChunk = newHandler()
+			onChunk = newHandler(round)
 		}
 		text, uerr := g.completeWithRetry(ctx, decoded.Model(), decoded.Messages(), onChunk)
 		if uerr != nil {
@@ -290,6 +304,12 @@ func (g *Gateway) loop(ctx context.Context, sess *toolbridge.Session, decoded *t
 			// 断流前的部分文本 → 上一轮的完整结果 → 空文本的 plain_text。
 			// 半截回答也比让用户等完一整轮重生成强，比空响应更强。
 			g.log.Warn("上游调用最终失败", "round", round, "error", uerr.Error())
+			g.audit.Record(ctx, observability.Event{
+				Kind: observability.EventUpstreamError, At: time.Now(),
+				// 错误正文不进审计（可能带上游私有 URL 与凭据回显），
+				// 只记机器可读的分类，够回答「这次是被拒绝还是上游挂了」。
+				ErrorCode: upstreamErrorCode(uerr),
+			})
 			if strings.TrimSpace(text) != "" {
 				g.log.Info("透传断流前的部分文本", "bytes", len(text))
 				return &toolbridge.Result{Outcome: toolbridge.OutcomePlainText, Text: text}
@@ -304,6 +324,11 @@ func (g *Gateway) loop(ctx context.Context, sess *toolbridge.Session, decoded *t
 		if res == nil {
 			// Parse 连结果对象都没给出（理论上不发生）：防御性兜底。
 			res = &toolbridge.Result{Outcome: toolbridge.OutcomePlainText, Text: text}
+		}
+		if res.Outcome == toolbridge.OutcomeCallsParsed {
+			// 审计与阶梯归位分开判断：会话键缺失（body 解析不出首条消息）
+			// 时阶梯无处归位，但调用照样发生了，不该因此漏审计。
+			g.recordProposals(ctx, sess, res)
 		}
 		if sk != "" && res.Outcome == toolbridge.OutcomeCallsParsed {
 			// 解析出调用 = 救援成功：该会话阶梯归位。
@@ -402,7 +427,48 @@ func (g *Gateway) recover(sess *toolbridge.Session, decoded *toolbridge.Request,
 		"remedy", d.Remedy,
 		"retry", rc.ShouldRetry,
 		"reason", rc.Reason)
+	// 拒绝分类是审计要单独回答的问题（「这次为什么没拿到调用」），
+	// 与上游错误分开上报——都塞进一条 error 日志里就只能靠读正文猜。
+	// Reason 是本项目自己生成的判定说明，不含模型文本。
+	g.audit.Record(context.Background(), observability.Event{
+		Kind: observability.EventRefusalClassified, At: time.Now(),
+		Decision: string(d.Remedy), Reason: rc.Reason,
+		ErrorCode: string(d.Kind),
+	})
 	return rc.ShouldRetry, rc.Messages, rc.Reason
+}
+
+// recordProposals 把本轮解析出的调用写进审计。
+//
+// 记的 call_id 与客户端实际收到的逐字相同（Session.Proposals 与渲染共用
+// 同一份构造），所以日志里的调用能和客户端回传的结果对上——审计链的价值
+// 全在这一点上。参数只留摘要，原文不进日志（不变量 7）。
+func (g *Gateway) recordProposals(ctx context.Context, sess *toolbridge.Session, res *toolbridge.Result) {
+	for _, p := range sess.Proposals(res) {
+		g.audit.Record(ctx, observability.ProposalEvent(observability.EventCallProposed, p, ""))
+	}
+}
+
+// upstreamErrorCode 把上游错误压成机器可读的分类。
+//
+// 正文一律不进审计：它可能带上游私有 URL、凭据回显或整页 HTML。
+func upstreamErrorCode(err error) string {
+	var ue *protocol.UpstreamError
+	if errors.As(err, &ue) {
+		switch {
+		case ue.Type != "":
+			return ue.Type
+		case ue.Status > 0:
+			return fmt.Sprintf("http_%d", ue.Status)
+		}
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "budget_exhausted"
+	}
+	if errors.Is(err, context.Canceled) {
+		return "client_gone"
+	}
+	return "upstream_unavailable"
 }
 
 // completeWithRetry 带静默重试的上游调用。
@@ -522,14 +588,19 @@ func isTransient(err error) bool {
 // 所以调用方不需要为「心跳与真实事件同时写」加锁——真流式下在第一个增量
 // 到达时停一次、循环结束再兜一次，两次都安全。少一把锁少一类交错 bug。
 type heartbeat struct {
-	stop chan struct{}
-	done chan struct{}
-	once sync.Once
+	stop  chan struct{}
+	done  chan struct{}
+	once  sync.Once
+	frame string
 }
 
 // startHeartbeat 起一个心跳协程。every 为 0 取默认间隔，负值直接关掉。
-func startHeartbeat(w io.Writer, every time.Duration) *heartbeat {
-	h := &heartbeat{stop: make(chan struct{}), done: make(chan struct{})}
+// frame 为空时用默认的 keepalive 注释帧。
+func startHeartbeat(w io.Writer, every time.Duration, frame string) *heartbeat {
+	if frame == "" {
+		frame = keepaliveFrame
+	}
+	h := &heartbeat{stop: make(chan struct{}), done: make(chan struct{}), frame: frame}
 	if every < 0 {
 		close(h.done)
 		return h
@@ -546,7 +617,7 @@ func startHeartbeat(w io.Writer, every time.Duration) *heartbeat {
 			case <-h.stop:
 				return
 			case <-t.C:
-				if _, err := io.WriteString(w, keepaliveFrame); err != nil {
+				if _, err := io.WriteString(w, h.frame); err != nil {
 					// 写失败说明客户端已经走了。停手即可：真正的收尾由
 					// ctx 取消驱动，心跳不该自己判断请求该不该继续。
 					return
@@ -615,11 +686,18 @@ func (g *Gateway) HandleSSE(ctx context.Context, protocolName string, body []byt
 		return fmt.Errorf("gateway: 建立流式渲染失败：%w", err)
 	}
 
-	// 心跳只覆盖「连接建立到第一个增量」的空窗。第一个增量到达前必须停掉：
-	// 之后 w 归渲染器独占，两个 goroutine 同时写同一个 writer 是数据竞争。
-	// Stop 是同步且幂等的，所以这里停一次、loop 之后再兜一次都安全。
-	hb := startHeartbeat(w, g.cfg.HeartbeatInterval)
-	defer hb.Stop()
+	// 心跳覆盖「本轮开始到本轮第一个增量」的空窗，每轮重起一次。
+	//
+	// 只起一次是不够的：真流式下第一轮一交付字节心跳就停了，而阶梯追问的
+	// 第 2、3 轮各要等上游 49-90 秒——那段时间会完全静默，正是不变量 20
+	// 要防的形态。第一个增量到达前必须停：之后 w 归渲染器独占，两个
+	// goroutine 同时写同一个 writer 是数据竞争。Stop 同步且幂等，所以
+	// 重复停、循环结束再兜一次都安全。
+	//
+	// hb 只在 loop 的调用栈里读写（newHandler 与 onChunk 都由适配器同步
+	// 调用），不需要加锁。
+	hb := startHeartbeat(w, g.cfg.HeartbeatInterval, "")
+	defer func() { hb.Stop() }()
 
 	// streamed 记下客户端实际收到的全部文本——收尾时用它作为 Result.Text
 	// 的权威值（不变量 8：增量与终态必须一致）。
@@ -628,7 +706,13 @@ func (g *Gateway) HandleSSE(ctx context.Context, protocolName string, body []byt
 
 	// 每一轮上游调用配一个新的 StreamParser：跨轮复用会把上一轮的半截
 	// 状态带进来。newHandler 在每轮开始时被 loop 调用。
-	newHandler := func() upstream.StreamHandler {
+	newHandler := func(round int) upstream.StreamHandler {
+		if round > 0 {
+			// 上一轮的心跳早在交付第一个增量时就停了；本轮又要等上游，
+			// 重新起一个，帧里带上轮次。
+			hb.Stop()
+			hb = startHeartbeat(w, g.cfg.HeartbeatInterval, roundKeepaliveFrame(round))
+		}
 		sp, err := sess.NewStreamParser()
 		if err != nil {
 			// 建不出解析器就本轮不做增量交付：文本仍会在收尾时一次性发出，

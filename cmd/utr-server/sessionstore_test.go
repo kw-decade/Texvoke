@@ -70,7 +70,13 @@ func TestSessionLadder(t *testing.T) {
 	}
 }
 
-// 成功调用把阶梯归位：同一个键在 parse 出调用后再卡住，从 L1 重新开始。
+// 成功调用把阶梯归位：同一个键在 parse 出调用后再卡住，阶梯从头爬——
+// 但**不重做能力说明**。
+//
+// 2026-09-01 真实 codex 长程实测：旧行为下同一个对话里 L1 出现了 4 次，
+// 每次都紧跟一次成功调用。L1 的内容模型早就完整看过，重复它只多一次上游
+// 往返（8-15 秒），是最没有新信息的那一次。所以 Succeed 保留
+// HandshakeDone，Recover 在 level<=1 且握手已做时直接从 L2 起步。
 func TestSessionLadderResetsOnSuccess(t *testing.T) {
 	s := testServer(t)
 
@@ -103,7 +109,8 @@ func TestSessionLadderResetsOnSuccess(t *testing.T) {
 		t.Fatalf("前置条件：应解析出调用，实际 %s（%s）", parsed.Outcome, parsed.Error)
 	}
 
-	// 再卡住：应从 L1 重新开始（能力说明），而不是接着 L3。
+	// 再卡住：阶梯归位到第 1 级（不是接着 L3），但因为握手已经做过，
+	// 实际手段从 L2 运行时通知起步。
 	rc := post(t, s.handleRecover, "/v1/recover", recoverRequest{
 		SessionID: "sr", RequestID: "rr", Nonce: nonce,
 		Result:     renderResult{Outcome: string(toolbridge.OutcomePlainText), Text: "我会先读取 AGENTS.md 再创建文件。"},
@@ -111,8 +118,11 @@ func TestSessionLadderResetsOnSuccess(t *testing.T) {
 		SessionKey: key,
 	})
 	out := decodeJSON[recoverResponse](t, rc)
-	if !out.HandshakeDone || out.Level != 1 {
-		t.Errorf("归位后应从 L1 开始（level=%d handshake=%v）：%s", out.Level, out.HandshakeDone, out.Reason)
+	if out.Level != 1 {
+		t.Errorf("阶梯应归位到第 1 级，得到 %d", out.Level)
+	}
+	if !strings.HasPrefix(out.Reason, "L2") {
+		t.Errorf("握手已做过，不该再来一遍能力说明，应从 L2 起步：%s", out.Reason)
 	}
 }
 

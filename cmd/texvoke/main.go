@@ -56,6 +56,11 @@ func main() {
 		allowRem  = flag.Bool("allow-remote", false, "允许监听非环回地址（需要显式开启）")
 		verbose   = flag.Bool("v", false, "输出调试日志")
 	)
+	// 子命令必须在 Parse 之前摘掉。标准 flag 包遇到第一个非 flag 参数就停止
+	// 解析，所以 `texvoke serve --upstream ...` 里的 flag 一个都不会被解析，
+	// 症状是「明明传了 --upstream 却报必填」——而 README 教的正是这个写法，
+	// 每个照做的新用户第一步就会撞上（2026-09-01 真实链路实测撞到）。
+	os.Args = stripServeSubcommand(os.Args)
 	flag.Parse()
 	// 唯一子命令 serve；直接裸跑也行（文档统一写 serve，容错不写死）。
 	if flag.NArg() > 0 && flag.Arg(0) != "serve" {
@@ -239,6 +244,19 @@ func buildAdapter(format, endpointURL, apiKey string) (upstream.Adapter, error) 
 	default:
 		return nil, fmt.Errorf("未知 format %q（当前支持 openai-chat）", format)
 	}
+}
+
+// stripServeSubcommand 把开头的 serve 子命令摘掉，让后面的 flag 能被解析。
+//
+// 只摘开头那一个：写在 flag 后面的 `texvoke --upstream x serve` 由
+// flag.Arg(0) 那条路径处理，未知子命令仍然要报错而不是被静默吃掉。
+func stripServeSubcommand(args []string) []string {
+	if len(args) > 1 && args[1] == "serve" {
+		out := make([]string, 0, len(args)-1)
+		out = append(out, args[0])
+		return append(out, args[2:]...)
+	}
+	return args
 }
 
 // proxiedClient 返回尊重 HTTPS_PROXY 环境变量的 HTTP 客户端。
