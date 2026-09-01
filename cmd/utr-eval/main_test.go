@@ -77,11 +77,11 @@ func TestClassifyRun(t *testing.T) {
 func TestOverrideModel(t *testing.T) {
 	body := []byte(`{"model":"claude-sonnet-4","messages":[]}`)
 
-	got, err := overrideModel(body, "gpt-5.6")
+	got, err := overrideModel(body, "gpt-4o")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := `"model":"gpt-5.6"`; !strings.Contains(string(got), want) {
+	if want := `"model":"gpt-4o"`; !strings.Contains(string(got), want) {
 		t.Fatalf("模型名没换掉：%s", got)
 	}
 
@@ -94,7 +94,7 @@ func TestOverrideModel(t *testing.T) {
 		t.Fatalf("空覆盖改动了 fixture：%s", same)
 	}
 
-	if _, err := overrideModel([]byte(`{`), "gpt-5.6"); err == nil {
+	if _, err := overrideModel([]byte(`{`), "gpt-4o"); err == nil {
 		t.Fatal("非法 JSON 必须报错而不是静默放过")
 	}
 }

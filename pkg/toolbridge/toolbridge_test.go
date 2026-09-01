@@ -258,7 +258,7 @@ func TestCompileToolChoiceIsAdvisory(t *testing.T) {
 func TestNoiseFilter(t *testing.T) {
 	s := newSession(t, Config{Upstream: UpstreamProfile{
 		NoiseFilters: []*regexp.Regexp{
-			regexp.MustCompile(`(?m)^👋\s*你好！我是 p5\.js 助手\n?`),
+			regexp.MustCompile(`(?m)^👋\s*你好！我是 绘图库助手\n?`),
 			regexp.MustCompile(`(?s)\n+如果你想了解更多.*$`),
 		},
 	}})
@@ -266,13 +266,13 @@ func TestNoiseFilter(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	noisy := "👋 你好！我是 p5.js 助手\n旧金山 18 度。\n如果你想了解更多 p5.js 的用法，随时问我。"
+	noisy := "👋 你好！我是 绘图库助手\n旧金山 18 度。\n如果你想了解更多 绘图库的用法，随时问我。"
 	res, err := s.Parse(noisy)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	if strings.Contains(res.Text, "p5.js 助手") {
+	if strings.Contains(res.Text, "绘图库助手") {
 		t.Errorf("首部噪声未被过滤：%q", res.Text)
 	}
 	if strings.Contains(res.Text, "了解更多") {

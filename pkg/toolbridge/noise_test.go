@@ -11,10 +11,10 @@ import (
 func legacyNoise() []*regexp.Regexp {
 	return []*regexp.Regexp{
 		// 首部品牌横幅
-		regexp.MustCompile(`(?m)^\s*(?:👋\s*)?(?:你好|Hi|Hello)[\s!！]*我是[^\n]*?p5\.?js[^\n]*\n+`),
+		regexp.MustCompile(`(?m)^\s*(?:👋\s*)?(?:你好|Hi|Hello)[\s!！]*我是[^\n]*?绘图库[^\n]*\n+`),
 		// 尾部锚定——这是难点所在
-		regexp.MustCompile(`(?s)\n+如果你.{0,40}?p5\.?js.{0,200}?$`),
-		regexp.MustCompile(`(?s)\n+想要.{0,20}?p5\.?js.{0,200}?$`),
+		regexp.MustCompile(`(?s)\n+如果你.{0,40}?绘图库.{0,200}?$`),
+		regexp.MustCompile(`(?s)\n+想要.{0,20}?绘图库.{0,200}?$`),
 	}
 }
 
@@ -44,9 +44,9 @@ func feedStream(t *testing.T, sp *StreamParser, input string, chunkSize int) str
 // 解法是在累积文本上反复跑正则（`$` 匹配当前结尾），一旦匹配就扣住
 // 从匹配起点起的全部内容；再用保留窗口兜住规则的回溯距离。
 func TestStreamTailNoiseNeverLeaks(t *testing.T) {
-	input := "👋 你好！我是 p5.js 助手\n" +
+	input := "👋 你好！我是 绘图库助手\n" +
 		"旧金山今天 18 度，适合出门。\n" +
-		"如果你想了解更多 p5.js 的绘图用法，随时问我。"
+		"如果你想了解更多 绘图库的用法，随时问我。"
 
 	// 各种切分粒度都不能漏。逐字节是最极端的情形。
 	for _, size := range []int{1, 2, 3, 7, 13, 64, 4096} {
@@ -64,7 +64,7 @@ func TestStreamTailNoiseNeverLeaks(t *testing.T) {
 			res := sp.Close()
 
 			// 转发出去的内容里不能有任何噪声痕迹。
-			for _, leak := range []string{"p5.js 助手", "如果你想了解更多", "随时问我"} {
+			for _, leak := range []string{"绘图库助手", "如果你想了解更多", "随时问我"} {
 				if strings.Contains(forwarded, leak) {
 					t.Errorf("噪声 %q 泄漏给了客户端：%q", leak, forwarded)
 				}
@@ -96,12 +96,12 @@ func TestStreamTailNoiseWithBacktrack(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// 分三次喂：第一段是正文，第二段单独看不构成匹配（缺 p5.js），
+	// 分三次喂：第一段是正文，第二段单独看不构成匹配（缺关键词），
 	// 第三段到了才让整条规则成立。
 	pieces := []string{
 		"这是正文内容。\n",
 		"如果你想深入一点，",
-		"可以看看 p5.js 的官方文档。",
+		"可以看看 绘图库的官方文档。",
 	}
 	var forwarded strings.Builder
 	for _, p := range pieces {
@@ -140,7 +140,7 @@ func TestStreamTailHoldTooSmallLeaks(t *testing.T) {
 	}
 
 	// 噪声跨越多次 Write，窗口太小兜不住。
-	pieces := []string{"正文。\n", "如果你想深入，", "看看 p5.js 文档。"}
+	pieces := []string{"正文。\n", "如果你想深入，", "看看 绘图库文档。"}
 	var forwarded strings.Builder
 	for _, p := range pieces {
 		safe, _ := sp.Write([]byte(p))

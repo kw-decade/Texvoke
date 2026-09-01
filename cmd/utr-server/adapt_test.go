@@ -130,7 +130,7 @@ func TestAdaptCrossProtocol(t *testing.T) {
 		Protocol: "anthropic", SessionID: "s1", RequestID: "r1",
 		Body:           json.RawMessage(protocolBodies()["anthropic"]),
 		TargetProtocol: "chat",
-		UpstreamModel:  "gpt-5.6-sol",
+		UpstreamModel:  "gpt-4o",
 	})
 	if rec.Code != 200 {
 		t.Fatalf("状态 %d：%s", rec.Code, rec.Body.String())
@@ -142,7 +142,7 @@ func TestAdaptCrossProtocol(t *testing.T) {
 	if !strings.Contains(up, `"messages"`) {
 		t.Errorf("应编成 Chat 形状：%s", up)
 	}
-	if !strings.Contains(up, "gpt-5.6-sol") {
+	if !strings.Contains(up, "gpt-4o") {
 		t.Errorf("上游模型名没换：%s", up)
 	}
 	// 但回报给调用方的仍是客户端问的那个。
